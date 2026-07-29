@@ -143,12 +143,15 @@ impl FormatAdapter for EpubAdapter {
                 })
                 .unwrap_or_default();
         }
-        // When the NCX contains fragment references that were stripped
-        // (e.g. Calibre filepos anchors), many entries collapse to the
-        // same byte offset.  Discard the NCX result and fall back to
-        // heading-based navigation.
+        // When Calibre filepos fragments are stripped every entry
+        // within a file lands on the same byte offset.  Try to
+        // recover by searching the assembled text for each entry's
+        // label so that the quality check below sees distinct offsets.
         if toc_has_collapsed_offsets(&toc) {
-            toc.clear();
+            toc = resolve_toc_by_labels(toc, &assembled.text);
+            if toc_has_collapsed_offsets(&toc) {
+                toc.clear();
+            }
         }
         if toc.is_empty() {
             toc = assembled.heading_toc;
@@ -834,14 +837,31 @@ fn digit_end(bytes: &[u8], start: usize) -> usize {
     end
 }
 
+fn resolve_toc_by_labels(toc: Vec<TocEntry>, text: &str) -> Vec<TocEntry> {
+    toc.into_iter()
+        .map(|mut entry| {
+            if let Some(found) = text[entry.offset()..].find(entry.label()) {
+                entry.offset = entry.offset() + found;
+            }
+            entry
+        })
+        .collect()
+}
+
 fn toc_has_collapsed_offsets(toc: &[TocEntry]) -> bool {
     if toc.len() <= 1 {
         return toc.is_empty();
     }
-    // When every entry resolves to the same byte offset the NCX
-    // fragments were stripped and the TOC is unusable.
-    let first = toc[0].offset();
-    toc.iter().all(|entry| entry.offset() == first)
+    let unique: std::collections::HashSet<usize> =
+        toc.iter().map(|entry| entry.offset()).collect();
+    // Every entry landing on the same byte is a sure sign of
+    // fragment stripping.
+    if unique.len() == 1 {
+        return true;
+    }
+    // When fewer than half the entries have distinct offsets and
+    // there are at least 5 entries, the NCX has lost information.
+    unique.len() * 2 < toc.len() && toc.len() >= 5
 }
 
 fn trim_zeroes(bytes: &[u8]) -> &[u8] {
@@ -1000,6 +1020,33 @@ mod tests {
     fn collapsed_toc_returns_false_for_single_entry() {
         let entries = vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }];
         assert!(!toc_has_collapsed_offsets(&entries));
+    }
+
+    #[test]
+    fn collapsed_toc_with_ratio_triggers() {
+        // 6 entries, 3 unique → 3*2=6, 6<6 is false, but 6>=5
+        // Wait: 6 entries, 2 unique → 2*2=4 < 6 → collapsed
+        let entries = vec![
+            TocEntry { label: "a".into(), offset: 100, depth: 0 },
+            TocEntry { label: "b".into(), offset: 100, depth: 0 },
+            TocEntry { label: "c".into(), offset: 100, depth: 0 },
+            TocEntry { label: "d".into(), offset: 200, depth: 0 },
+            TocEntry { label: "e".into(), offset: 200, depth: 0 },
+            TocEntry { label: "f".into(), offset: 200, depth: 0 },
+        ];
+        assert!(toc_has_collapsed_offsets(&entries));
+    }
+
+    #[test]
+    fn resolve_toc_by_labels_finds_text() {
+        let entries = vec![
+            TocEntry { label: "第一章".into(), offset: 0, depth: 0 },
+            TocEntry { label: "第二章".into(), offset: 0, depth: 0 },
+        ];
+        let text = "前言\n第一章 开始\n第二章 继续\n";
+        let resolved = resolve_toc_by_labels(entries, text);
+        assert_eq!(resolved[0].offset(), 7); // "第一章" after "前言\n"
+        assert!(resolved[1].offset() > resolved[0].offset());
     }
 
     fn make_epub(entries: &[(&str, &str)]) -> Vec<u8> {

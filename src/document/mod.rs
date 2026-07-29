@@ -345,11 +345,20 @@ pub(crate) fn detect_chapter_headings(text: &str) -> Vec<TocEntry> {
 }
 
 fn match_chapter_heading(line: &str) -> Option<&str> {
-    // "第X章", "第X回", "第X节", "第X卷", "第X集", "第X部"
-    if let Some(rest) = line.strip_prefix('第') {
-        let num_end = chinese_number_end(rest)?;
-        let after_num = &rest[num_end..];
-        let unit_end = after_num
+    // Scan the whole line for "第X{unit}" patterns and pick the
+    // best one.  "章" (chapter) outranks "卷" (volume) so that
+    // lines like "第一卷 第一章 心事一灯知" produce chapter entries
+    // rather than volume entries.
+    let mut best: Option<(usize, &str)> = None;
+    let mut search = line;
+    while let Some(pos) = search.find('第') {
+        let after_di = &search[pos + 3..]; // skip UTF-8 "第" (3 bytes)
+        let Some(num_end) = chinese_number_end(after_di) else {
+            search = after_di;
+            continue;
+        };
+        let after_num = &after_di[num_end..];
+        let unit_bytes = after_num
             .strip_prefix('章')
             .or_else(|| after_num.strip_prefix('回'))
             .or_else(|| after_num.strip_prefix('节'))
@@ -357,11 +366,25 @@ fn match_chapter_heading(line: &str) -> Option<&str> {
             .or_else(|| after_num.strip_prefix('卷'))
             .or_else(|| after_num.strip_prefix('集'))
             .or_else(|| after_num.strip_prefix('部'));
-        if unit_end.is_some() {
-            // Take the matched prefix + title up to next space or line end
-            let total = "第".len() + num_end + 3; // 3 bytes for the UTF-8 unit char
-            return Some(&line[..total.min(line.len())]);
+        if unit_bytes.is_some() {
+            let unit_char = after_num.chars().next().unwrap();
+            let priority = unit_priority(unit_char);
+            let match_start = &search[pos..];
+            let total_len = 3 + num_end + unit_char.len_utf8(); // 第 + number + unit
+            let label = &match_start[..total_len.min(match_start.len())];
+            // Translate the match_start offset to the original line
+            let line_offset = line.len() - search.len() + pos;
+            let line_label = &line[line_offset..line_offset + label.len()];
+            if best.as_ref().is_none_or(|(prev_prio, _)| priority > *prev_prio) {
+                best = Some((priority, line_label));
+            }
         }
+        // Advance past this "第" to look for more chapter markers
+        search = &search[pos + 3..];
+    }
+
+    if let Some((_, label)) = best {
+        return Some(label);
     }
 
     // Special chapters: 序章, 终章, 尾声, 楔子, 引子, 番外, 代序, 跋
@@ -382,6 +405,18 @@ fn match_chapter_heading(line: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn unit_priority(unit: char) -> usize {
+    match unit {
+        '章' => 7,
+        '回' => 6,
+        '节' | '節' => 5,
+        '卷' => 4,
+        '集' => 3,
+        '部' => 2,
+        _ => 0,
+    }
 }
 
 /// Returns the byte length of leading Chinese numerals + Arabic digits in `s`.
@@ -450,5 +485,14 @@ mod tests {
         // Chapter markers mid-line or without proper structure are not headings
         let toc = detect_chapter_headings("这是第一次尝试\n今天读了序章部分\n第一眼见到她");
         assert_eq!(toc.len(), 0);
+    }
+
+    #[test]
+    fn prefers_chapter_over_volume() {
+        // "第一卷 第一章" should produce "第一章", not "第一卷"
+        let toc = detect_chapter_headings("第一卷 最后一战 第一章 心事一灯知\n第二卷 去日重来 第一章 痛作无家别");
+        assert_eq!(toc.len(), 2);
+        assert!(toc[0].label().starts_with("第一章"));
+        assert!(toc[1].label().starts_with("第一章"));
     }
 }
