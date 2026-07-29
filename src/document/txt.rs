@@ -4,7 +4,7 @@ use encoding_rs::GBK;
 
 use super::{
     AdapterInput, AdapterOutput, DocumentFormat, DocumentMetadata, FormatAdapter, LoadError,
-    LoadWarning, plain_document,
+    LoadWarning, detect_chapter_headings, plain_document,
 };
 
 pub(super) struct TxtAdapter;
@@ -52,7 +52,8 @@ impl FormatAdapter for TxtAdapter {
             Vec::new()
         };
 
-        Ok(AdapterOutput { document: plain_document(text, metadata, title), warnings })
+        let toc = detect_chapter_headings(&text);
+        Ok(AdapterOutput { document: plain_document(text, metadata, title, toc), warnings })
     }
 }
 

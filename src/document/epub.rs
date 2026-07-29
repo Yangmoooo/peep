@@ -12,6 +12,7 @@ use zip::ZipArchive;
 use super::{
     AdapterInput, AdapterOutput, CanonicalDocument, DocumentFormat, DocumentMetadata,
     FormatAdapter, LoadError, LoadWarning, Section, TextStyle, TextStyleKind, TocEntry,
+    detect_chapter_headings,
 };
 
 pub(super) struct EpubAdapter;
@@ -142,12 +143,28 @@ impl FormatAdapter for EpubAdapter {
                 })
                 .unwrap_or_default();
         }
+        // When the NCX contains fragment references that were stripped
+        // (e.g. Calibre filepos anchors), many entries collapse to the
+        // same byte offset.  Discard the NCX result and fall back to
+        // heading-based navigation.
+        if toc_has_collapsed_offsets(&toc) {
+            toc.clear();
+        }
         if toc.is_empty() {
             toc = assembled.heading_toc;
             if !toc.is_empty() {
                 warnings.push(LoadWarning::new(
                     "epub.toc_recovered",
-                    "the EPUB navigation document was missing; built a table of contents from headings",
+                    "the EPUB navigation was missing or ambiguous; built a table of contents from headings",
+                ));
+            }
+        }
+        if toc.is_empty() {
+            toc = detect_chapter_headings(&assembled.text);
+            if !toc.is_empty() {
+                warnings.push(LoadWarning::new(
+                    "epub.toc_recovered",
+                    "the EPUB had no usable navigation; detected chapter headings from text",
                 ));
             }
         }
@@ -294,7 +311,7 @@ fn parse_package(xml: &str, opf_path: &str) -> Result<Package, String> {
                 || node.attribute("content") == Some("pre-paginated"))
     });
     if fixed_layout {
-        return Err("fixed-layout EPUB is not supported".to_owned());
+        return Err("fixed-layout EPUB is not supported; this format lays out text as fixed-position pages (similar to a PDF) and cannot be reflowed as plain text".to_owned());
     }
 
     let mut manifest = HashMap::new();
@@ -817,6 +834,16 @@ fn digit_end(bytes: &[u8], start: usize) -> usize {
     end
 }
 
+fn toc_has_collapsed_offsets(toc: &[TocEntry]) -> bool {
+    if toc.len() <= 1 {
+        return toc.is_empty();
+    }
+    // When every entry resolves to the same byte offset the NCX
+    // fragments were stripped and the TOC is unusable.
+    let first = toc[0].offset();
+    toc.iter().all(|entry| entry.offset() == first)
+}
+
 fn trim_zeroes(bytes: &[u8]) -> &[u8] {
     let first_nonzero =
         bytes.iter().position(|byte| *byte != b'0').unwrap_or(bytes.len().saturating_sub(1));
@@ -953,6 +980,26 @@ mod tests {
     #[test]
     fn natural_sort_orders_numeric_segments() {
         assert_eq!(natural_cmp("chapter2.xhtml", "chapter10.xhtml"), Ordering::Less);
+    }
+
+    #[test]
+    fn collapsed_toc_detects_stripped_fragments() {
+        let entries =
+            vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }, TocEntry { label: "b".into(), offset: 100, depth: 0 }];
+        assert!(toc_has_collapsed_offsets(&entries));
+    }
+
+    #[test]
+    fn collapsed_toc_passes_valid_toc() {
+        let entries =
+            vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }, TocEntry { label: "b".into(), offset: 200, depth: 0 }];
+        assert!(!toc_has_collapsed_offsets(&entries));
+    }
+
+    #[test]
+    fn collapsed_toc_returns_false_for_single_entry() {
+        let entries = vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }];
+        assert!(!toc_has_collapsed_offsets(&entries));
     }
 
     fn make_epub(entries: &[(&str, &str)]) -> Vec<u8> {

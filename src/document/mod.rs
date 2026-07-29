@@ -312,13 +312,143 @@ fn plain_document(
     text: String,
     metadata: DocumentMetadata,
     section_title: String,
+    toc: Vec<TocEntry>,
 ) -> CanonicalDocument {
     let end = text.len();
     CanonicalDocument::new(
         text,
         metadata,
         vec![Section { title: section_title, range: 0..end }],
-        Vec::new(),
+        toc,
         Vec::new(),
     )
+}
+
+pub(crate) fn detect_chapter_headings(text: &str) -> Vec<TocEntry> {
+    let mut entries = Vec::new();
+    let mut byte_offset = 0;
+    for line in text.split('\n') {
+        let line_len = line.len();
+        let trimmed = line.trim_start();
+        if let Some(label) = match_chapter_heading(trimmed) {
+            let leading_spaces = line_len - trimmed.len();
+            entries.push(TocEntry { label: label.to_owned(), offset: byte_offset + leading_spaces, depth: 0 });
+        }
+        byte_offset += line_len + 1; // +1 for '\n'
+    }
+    // Fix up the last entry: text doesn't end with '\n'
+    if entries.last().is_some_and(|entry| entry.offset > text.len()) {
+        let last = entries.last_mut().unwrap();
+        last.offset = last.offset.min(text.len());
+    }
+    entries
+}
+
+fn match_chapter_heading(line: &str) -> Option<&str> {
+    // "第X章", "第X回", "第X节", "第X卷", "第X集", "第X部"
+    if let Some(rest) = line.strip_prefix('第') {
+        let num_end = chinese_number_end(rest)?;
+        let after_num = &rest[num_end..];
+        let unit_end = after_num
+            .strip_prefix('章')
+            .or_else(|| after_num.strip_prefix('回'))
+            .or_else(|| after_num.strip_prefix('节'))
+            .or_else(|| after_num.strip_prefix('節'))
+            .or_else(|| after_num.strip_prefix('卷'))
+            .or_else(|| after_num.strip_prefix('集'))
+            .or_else(|| after_num.strip_prefix('部'));
+        if unit_end.is_some() {
+            // Take the matched prefix + title up to next space or line end
+            let total = "第".len() + num_end + 3; // 3 bytes for the UTF-8 unit char
+            return Some(&line[..total.min(line.len())]);
+        }
+    }
+
+    // Special chapters: 序章, 终章, 尾声, 楔子, 引子, 番外, 代序, 跋
+    for &special in &["序章", "终章", "尾声", "楔子", "引子", "番外", "代序", "跋", "尾聲"] {
+        if line.starts_with(special) {
+            return Some(special);
+        }
+    }
+
+    // English: "Chapter N" / "CHAPTER N"
+    if let Some(rest) = line.strip_prefix("Chapter ")
+        .or_else(|| line.strip_prefix("CHAPTER "))
+    {
+        let digits_end = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits_end > 0 {
+            return Some(&line[.."Chapter ".len() + digits_end]);
+        }
+    }
+
+    None
+}
+
+/// Returns the byte length of leading Chinese numerals + Arabic digits in `s`.
+/// Returns `None` if no numeral is found.
+fn chinese_number_end(s: &str) -> Option<usize> {
+    let chinese_digits = [
+        '零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '百', '千', '万',
+        '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖', '拾', '佰', '仟',
+    ];
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_digit() && !chinese_digits.contains(&first) {
+        return None;
+    }
+    let mut end = first.len_utf8();
+    for ch in chars {
+        if ch.is_ascii_digit() || chinese_digits.contains(&ch) {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_chinese_chapter_headings() {
+        let text = "第一章 相遇\n正文开始\n第二章 离别\n";
+        let toc = detect_chapter_headings(text);
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].label(), "第一章");
+        assert_eq!(toc[0].offset(), 0);
+        assert_eq!(toc[1].label(), "第二章");
+    }
+
+    #[test]
+    fn detects_arabic_chapter_numbers() {
+        let toc = detect_chapter_headings("第1章\n内容\n第12回");
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].label(), "第1章");
+        assert_eq!(toc[1].label(), "第12回");
+    }
+
+    #[test]
+    fn detects_special_chapters() {
+        let toc = detect_chapter_headings("序章\n正文\n尾声\n后记");
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].label(), "序章");
+        assert_eq!(toc[1].label(), "尾声");
+    }
+
+    #[test]
+    fn detects_english_chapters() {
+        let toc = detect_chapter_headings("Chapter 1\nContent\nChapter 12\nMore");
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].label(), "Chapter 1");
+        assert_eq!(toc[1].label(), "Chapter 12");
+    }
+
+    #[test]
+    fn ignores_false_positives() {
+        // Chapter markers mid-line or without proper structure are not headings
+        let toc = detect_chapter_headings("这是第一次尝试\n今天读了序章部分\n第一眼见到她");
+        assert_eq!(toc.len(), 0);
+    }
 }
