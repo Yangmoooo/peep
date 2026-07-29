@@ -27,7 +27,7 @@ mod imp {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{DefaultColors, parse_default_colors};
+    use super::DefaultColors;
 
     pub(super) fn detect_default_colors(timeout: Duration) -> Option<DefaultColors> {
         let mut input =
@@ -56,6 +56,57 @@ mod imp {
                 return None;
             }
             thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn parse_default_colors(buffer: &[u8]) -> Option<DefaultColors> {
+        Some(DefaultColors {
+            foreground: parse_osc_color(buffer, 10)?,
+            background: parse_osc_color(buffer, 11)?,
+        })
+    }
+
+    fn parse_osc_color(buffer: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
+        let prefix = format!("\x1B]{slot};");
+        let start = buffer.windows(prefix.len()).position(|window| window == prefix.as_bytes())?;
+        let rest = &buffer[start + prefix.len()..];
+        let end = rest
+            .iter()
+            .position(|byte| *byte == 0x07)
+            .or_else(|| rest.windows(2).position(|window| window == b"\x1B\\"))?;
+        parse_osc_rgb(std::str::from_utf8(&rest[..end]).ok()?)
+    }
+
+    fn parse_osc_rgb(value: &str) -> Option<(u8, u8, u8)> {
+        let (kind, channels) = value.trim().split_once(':')?;
+        if !kind.eq_ignore_ascii_case("rgb") {
+            return None;
+        }
+        let mut channels = channels.split('/');
+        let red = parse_component(channels.next()?)?;
+        let green = parse_component(channels.next()?)?;
+        let blue = parse_component(channels.next()?)?;
+        channels.next().is_none().then_some((red, green, blue))
+    }
+
+    fn parse_component(value: &str) -> Option<u8> {
+        match value.len() {
+            2 => u8::from_str_radix(value, 16).ok(),
+            4 => u16::from_str_radix(value, 16).ok().map(|value| (value / 257) as u8),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_terminal_colors_in_either_order() {
+            assert_eq!(
+                parse_default_colors(b"\x1B]11;rgb:ffff/ffff/ffff\x07\x1B]10;rgb:1111/2222/3333\x1B\\"),
+                Some(DefaultColors { foreground: (17, 34, 51), background: (255, 255, 255) })
+            );
         }
     }
 }
@@ -107,55 +158,4 @@ mod imp {
     use super::DefaultColors;
 
     pub(super) fn detect_default_colors(_timeout: Duration) -> Option<DefaultColors> { None }
-}
-
-fn parse_default_colors(buffer: &[u8]) -> Option<DefaultColors> {
-    Some(DefaultColors {
-        foreground: parse_osc_color(buffer, 10)?,
-        background: parse_osc_color(buffer, 11)?,
-    })
-}
-
-fn parse_osc_color(buffer: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
-    let prefix = format!("\x1B]{slot};");
-    let start = buffer.windows(prefix.len()).position(|window| window == prefix.as_bytes())?;
-    let rest = &buffer[start + prefix.len()..];
-    let end = rest
-        .iter()
-        .position(|byte| *byte == 0x07)
-        .or_else(|| rest.windows(2).position(|window| window == b"\x1B\\"))?;
-    parse_osc_rgb(std::str::from_utf8(&rest[..end]).ok()?)
-}
-
-fn parse_osc_rgb(value: &str) -> Option<(u8, u8, u8)> {
-    let (kind, channels) = value.trim().split_once(':')?;
-    if !kind.eq_ignore_ascii_case("rgb") {
-        return None;
-    }
-    let mut channels = channels.split('/');
-    let red = parse_component(channels.next()?)?;
-    let green = parse_component(channels.next()?)?;
-    let blue = parse_component(channels.next()?)?;
-    channels.next().is_none().then_some((red, green, blue))
-}
-
-fn parse_component(value: &str) -> Option<u8> {
-    match value.len() {
-        2 => u8::from_str_radix(value, 16).ok(),
-        4 => u16::from_str_radix(value, 16).ok().map(|value| (value / 257) as u8),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_terminal_colors_in_either_order() {
-        assert_eq!(
-            parse_default_colors(b"\x1B]11;rgb:ffff/ffff/ffff\x07\x1B]10;rgb:1111/2222/3333\x1B\\"),
-            Some(DefaultColors { foreground: (17, 34, 51), background: (255, 255, 255) })
-        );
-    }
 }
