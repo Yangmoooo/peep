@@ -840,8 +840,11 @@ fn digit_end(bytes: &[u8], start: usize) -> usize {
 fn resolve_toc_by_labels(toc: Vec<TocEntry>, text: &str) -> Vec<TocEntry> {
     toc.into_iter()
         .map(|mut entry| {
-            if let Some(found) = text[entry.offset()..].find(entry.label()) {
-                entry.offset = entry.offset() + found;
+            // Use rfind so that when the label appears both in a
+            // leading TOC page and later in the actual chapter body
+            // the TOC entry points to the chapter, not the TOC.
+            if let Some(found) = text.rfind(entry.label()) {
+                entry.offset = found;
             }
             entry
         })
@@ -1038,14 +1041,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_toc_by_labels_finds_text() {
+    fn resolve_toc_by_labels_uses_last_occurrence() {
+        // TOC page lists "第一章" first, actual chapter comes later.
+        // rfind picks the last (actual chapter) position.
         let entries = vec![
             TocEntry { label: "第一章".into(), offset: 0, depth: 0 },
             TocEntry { label: "第二章".into(), offset: 0, depth: 0 },
         ];
-        let text = "前言\n第一章 开始\n第二章 继续\n";
+        let text = "目录 第一章 第二章\n第一章 开始\n第二章 继续\n";
         let resolved = resolve_toc_by_labels(entries, text);
-        assert_eq!(resolved[0].offset(), 7); // "第一章" after "前言\n"
+        // Both should find the later occurrence (actual chapters, not TOC)
+        assert!(resolved[0].offset() > 10); // after the TOC line
         assert!(resolved[1].offset() > resolved[0].offset());
     }
 

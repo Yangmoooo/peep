@@ -326,13 +326,47 @@ fn plain_document(
 
 pub(crate) fn detect_chapter_headings(text: &str) -> Vec<TocEntry> {
     let mut entries = Vec::new();
+    let mut current_volume: Option<String> = None;
     let mut byte_offset = 0;
     for line in text.split('\n') {
         let line_len = line.len();
         let trimmed = line.trim_start();
-        if let Some(label) = match_chapter_heading(trimmed) {
-            let leading_spaces = line_len - trimmed.len();
-            entries.push(TocEntry { label: label.to_owned(), offset: byte_offset + leading_spaces, depth: 0 });
+        let leading_spaces = line_len - trimmed.len();
+        let line_offset = byte_offset + leading_spaces;
+
+        let markers = find_all_markers(trimmed, line_offset);
+        if markers.is_empty() {
+            // Try special chapters and English patterns
+            if let Some(label) = match_standalone_heading(trimmed) {
+                entries.push(TocEntry { label: label.to_owned(), offset: line_offset, depth: 0 });
+            }
+        } else {
+            // Emit volume entries for volume markers on this line
+            for marker in &markers {
+                if marker.unit == '卷' {
+                    let is_new = current_volume.as_deref() != Some(marker.label.as_str());
+                    if is_new {
+                        current_volume = Some(marker.label.clone());
+                        entries.push(TocEntry {
+                            label: marker.full_label(),
+                            offset: marker.line_offset,
+                            depth: 0,
+                        });
+                    }
+                }
+            }
+            // Emit chapter entries (章, 回, 节) — prefer 章 over others
+            let chapter_marker = markers
+                .iter()
+                .filter(|m| m.unit != '卷')
+                .max_by_key(|m| unit_priority(m.unit));
+            if let Some(marker) = chapter_marker {
+                entries.push(TocEntry {
+                    label: marker.full_label(),
+                    offset: marker.line_offset,
+                    depth: if current_volume.is_some() { 1 } else { 0 },
+                });
+            }
         }
         byte_offset += line_len + 1; // +1 for '\n'
     }
@@ -344,57 +378,74 @@ pub(crate) fn detect_chapter_headings(text: &str) -> Vec<TocEntry> {
     entries
 }
 
-fn match_chapter_heading(line: &str) -> Option<&str> {
-    // Scan the whole line for "第X{unit}" patterns and pick the
-    // best one.  "章" (chapter) outranks "卷" (volume) so that
-    // lines like "第一卷 第一章 心事一灯知" produce chapter entries
-    // rather than volume entries.
-    let mut best: Option<(usize, &str)> = None;
-    let mut search = line;
-    while let Some(pos) = search.find('第') {
-        let after_di = &search[pos + 3..]; // skip UTF-8 "第" (3 bytes)
+#[derive(Debug)]
+struct ChapterMarker {
+    pub label: String, // e.g. "第一章", "第一卷"
+    pub unit: char, // '章', '卷', '回', '节', etc.
+    pub after: String, // text after the unit char until next marker or EOL
+    pub line_offset: usize, // byte offset of this marker in the full text
+}
+
+impl ChapterMarker {
+    /// Returns the label with subtitle, e.g. "第一卷 最后一战" or "第一章 心事一灯知"
+    fn full_label(&self) -> String {
+        let after = self.after.trim();
+        if after.is_empty() { self.label.clone() } else { format!("{} {}", self.label, after) }
+    }
+}
+
+/// Finds all "第X{unit}" markers on a line, returning them in order of appearance.
+fn find_all_markers(line: &str, line_offset: usize) -> Vec<ChapterMarker> {
+    let mut markers = Vec::new();
+    // Find all positions of '第' in the line
+    let mut byte_pos = 0;
+    let line_bytes = line.as_bytes();
+    while byte_pos < line_bytes.len() {
+        let rest = &line[byte_pos..];
+        let Some(di_pos) = rest.find('第') else {
+            break;
+        };
+        let abs_pos = byte_pos + di_pos;
+        let after_di = &line[abs_pos + 3..]; // skip UTF-8 "第" (3 bytes)
         let Some(num_end) = chinese_number_end(after_di) else {
-            search = after_di;
+            byte_pos = abs_pos + 3;
             continue;
         };
         let after_num = &after_di[num_end..];
-        let unit_bytes = after_num
-            .strip_prefix('章')
-            .or_else(|| after_num.strip_prefix('回'))
-            .or_else(|| after_num.strip_prefix('节'))
-            .or_else(|| after_num.strip_prefix('節'))
-            .or_else(|| after_num.strip_prefix('卷'))
-            .or_else(|| after_num.strip_prefix('集'))
-            .or_else(|| after_num.strip_prefix('部'));
-        if unit_bytes.is_some() {
-            let unit_char = after_num.chars().next().unwrap();
-            let priority = unit_priority(unit_char);
-            let match_start = &search[pos..];
-            let total_len = 3 + num_end + unit_char.len_utf8(); // 第 + number + unit
-            let label = &match_start[..total_len.min(match_start.len())];
-            // Translate the match_start offset to the original line
-            let line_offset = line.len() - search.len() + pos;
-            let line_label = &line[line_offset..line_offset + label.len()];
-            if best.as_ref().is_none_or(|(prev_prio, _)| priority > *prev_prio) {
-                best = Some((priority, line_label));
-            }
+        let unit_char = after_num.chars().next();
+        let is_chapter_unit = unit_char.is_some_and(|ch| {
+            matches!(ch, '章' | '回' | '节' | '節' | '卷' | '集' | '部')
+        });
+        if !is_chapter_unit {
+            byte_pos = abs_pos + 3;
+            continue;
         }
-        // Advance past this "第" to look for more chapter markers
-        search = &search[pos + 3..];
-    }
+        let unit_char = unit_char.unwrap();
+        let label_end = 3 + num_end + unit_char.len_utf8(); // 第 + number + unit
+        let label = &line[abs_pos..abs_pos + label_end];
 
-    if let Some((_, label)) = best {
-        return Some(label);
-    }
+        // Subtitle: text from after the unit char to the next "第" marker
+        let after_marker = &line[abs_pos + label_end..];
+        let subtitle_end = after_marker.find('第').unwrap_or(after_marker.len());
+        let after = after_marker[..subtitle_end].trim().to_owned();
 
-    // Special chapters: 序章, 终章, 尾声, 楔子, 引子, 番外, 代序, 跋
+        markers.push(ChapterMarker {
+            label: label.to_owned(),
+            unit: unit_char,
+            after,
+            line_offset: line_offset + abs_pos,
+        });
+        byte_pos = abs_pos + 3; // advance past this '第'
+    }
+    markers
+}
+
+fn match_standalone_heading(line: &str) -> Option<&str> {
     for &special in &["序章", "终章", "尾声", "楔子", "引子", "番外", "代序", "跋", "尾聲"] {
         if line.starts_with(special) {
             return Some(special);
         }
     }
-
-    // English: "Chapter N" / "CHAPTER N"
     if let Some(rest) = line.strip_prefix("Chapter ")
         .or_else(|| line.strip_prefix("CHAPTER "))
     {
@@ -403,7 +454,6 @@ fn match_chapter_heading(line: &str) -> Option<&str> {
             return Some(&line[.."Chapter ".len() + digits_end]);
         }
     }
-
     None
 }
 
@@ -451,9 +501,9 @@ mod tests {
         let text = "第一章 相遇\n正文开始\n第二章 离别\n";
         let toc = detect_chapter_headings(text);
         assert_eq!(toc.len(), 2);
-        assert_eq!(toc[0].label(), "第一章");
+        assert_eq!(toc[0].label(), "第一章 相遇");
         assert_eq!(toc[0].offset(), 0);
-        assert_eq!(toc[1].label(), "第二章");
+        assert_eq!(toc[1].label(), "第二章 离别");
     }
 
     #[test]
@@ -488,11 +538,22 @@ mod tests {
     }
 
     #[test]
-    fn prefers_chapter_over_volume() {
-        // "第一卷 第一章" should produce "第一章", not "第一卷"
+    fn volume_and_chapter_compound_entries() {
+        // Lines with both volume and chapter produce volume (depth 0)
+        // and chapter (depth 1) entries.
         let toc = detect_chapter_headings("第一卷 最后一战 第一章 心事一灯知\n第二卷 去日重来 第一章 痛作无家别");
-        assert_eq!(toc.len(), 2);
-        assert!(toc[0].label().starts_with("第一章"));
-        assert!(toc[1].label().starts_with("第一章"));
+        assert_eq!(toc.len(), 4);
+        // Volume entries
+        assert_eq!(toc[0].label(), "第一卷 最后一战");
+        assert_eq!(toc[0].depth, 0);
+        // Chapter under first volume
+        assert_eq!(toc[1].label(), "第一章 心事一灯知");
+        assert_eq!(toc[1].depth, 1);
+        // Second volume
+        assert_eq!(toc[2].label(), "第二卷 去日重来");
+        assert_eq!(toc[2].depth, 0);
+        // Chapter under second volume
+        assert_eq!(toc[3].label(), "第一章 痛作无家别");
+        assert_eq!(toc[3].depth, 1);
     }
 }
