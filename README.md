@@ -12,9 +12,12 @@ Peep 是一个本地、离线的终端 EPUB/TXT 阅读器。界面保持为克�
 - macOS、Linux 和 Windows Terminal。
 - 完全离线，无模型调用、遥测或远程 EPUB 资源加载。
 
-## 构建与运行
+## 安装与运行
 
-需要 Rust 1.88 或更新版本。
+可以从 [GitHub Releases][releases] 下载 Linux x86_64、Windows x86_64 或
+macOS Apple Silicon 的预编译包。解压后将 `peep`（Windows 为 `peep.exe`）放入 `PATH`。
+
+从源码构建需要 Rust 1.88 或更新版本：
 
 ```bash
 cargo build --release
@@ -107,3 +110,5 @@ cargo build --release --locked
 ## License
 
 MIT
+
+[releases]: https://github.com/Yangmoooo/peep/releases

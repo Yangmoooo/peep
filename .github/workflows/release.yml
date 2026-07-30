@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-x86_64-musl
+            bin_name: peep
+            archive_ext: .tar.xz
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64-gnu
+            bin_name: peep
+            archive_ext: .tar.xz
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64-msvc
+            bin_name: peep.exe
+            archive_ext: .zip
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos-aarch64-darwin
+            bin_name: peep
+            archive_ext: .tar.xz
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          args: --release --locked --bin peep
+          target: ${{ matrix.target }}
+
+      - name: Prepare assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
+          cp README.md LICENSE dist/
+
+      - name: Create archive
+        shell: bash
+        run: |
+          ARCHIVE_NAME="peep-${{ matrix.platform }}${{ matrix.archive_ext }}"
+
+          cd dist
+          if [ "${{ matrix.archive_ext }}" = ".tar.xz" ]; then
+            tar -cJvf "../$ARCHIVE_NAME" *
+          else
+            7z a "../$ARCHIVE_NAME" *
+          fi
+
+          echo "ASSET=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: artifacts-${{ matrix.platform }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Install Changelog parser
+        uses: taiki-e/install-action@parse-changelog
+
+      - name: Parse Changelog
+        run: parse-changelog CHANGELOG.md ${GITHUB_REF_NAME#v} > release_note.md
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body_path: release_note.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
