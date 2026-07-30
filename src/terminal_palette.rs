@@ -104,7 +104,9 @@ mod imp {
         #[test]
         fn parses_terminal_colors_in_either_order() {
             assert_eq!(
-                parse_default_colors(b"\x1B]11;rgb:ffff/ffff/ffff\x07\x1B]10;rgb:1111/2222/3333\x1B\\"),
+                parse_default_colors(
+                    b"\x1B]11;rgb:ffff/ffff/ffff\x07\x1B]10;rgb:1111/2222/3333\x1B\\"
+                ),
                 Some(DefaultColors { foreground: (17, 34, 51), background: (255, 255, 255) })
             );
         }

@@ -53,7 +53,7 @@ pub struct App {
     search_task: Option<(u64, mpsc::Receiver<SearchTaskResult>)>,
     search_generation: u64,
     viewport_height: usize,
-    overlay_max_scroll: usize,
+    overlay_max_position: usize,
     overlay_page_rows: usize,
     dirty_progress: bool,
     last_move: Instant,
@@ -90,7 +90,7 @@ impl App {
             search_task: None,
             search_generation: 0,
             viewport_height: 1,
-            overlay_max_scroll: 0,
+            overlay_max_position: 0,
             overlay_page_rows: 1,
             dirty_progress: false,
             last_move: Instant::now(),
@@ -110,13 +110,14 @@ impl App {
 
     pub fn overlay(&self) -> Option<&OverlayState> { self.overlay.as_ref() }
 
-    pub fn set_overlay_scroll_extent(&mut self, content_rows: usize, viewport_rows: usize) {
-        self.overlay_max_scroll = content_rows.saturating_sub(viewport_rows);
+    pub fn set_overlay_layout(&mut self, content_rows: usize, viewport_rows: usize) {
         self.overlay_page_rows = viewport_rows.max(1);
-        if let Some(overlay) = self.overlay.as_mut()
-            && overlay.kind != OverlayKind::Toc
-        {
-            overlay.selected = overlay.selected.min(self.overlay_max_scroll);
+        self.overlay_max_position = self.overlay.as_ref().map_or(0, |overlay| match overlay.kind {
+            OverlayKind::Toc => content_rows.saturating_sub(1),
+            OverlayKind::Help | OverlayKind::Info => content_rows.saturating_sub(viewport_rows),
+        });
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.selected = overlay.selected.min(self.overlay_max_position);
         }
     }
 
@@ -192,20 +193,15 @@ impl App {
     }
 
     pub fn scroll_mouse(&mut self, lines: isize) {
-        let Some(kind) = self.overlay.as_ref().map(|overlay| overlay.kind) else {
+        if self.overlay.is_none() {
             self.scroll(lines);
             return;
-        };
-        let toc_max = self
-            .loaded
-            .as_ref()
-            .map_or(0, |loaded| loaded.document().toc().len().saturating_sub(1));
-        let max = if kind == OverlayKind::Toc { toc_max } else { self.overlay_max_scroll };
+        }
         let Some(overlay) = self.overlay.as_mut() else {
             return;
         };
         overlay.selected = if lines >= 0 {
-            overlay.selected.saturating_add(lines as usize).min(max)
+            overlay.selected.saturating_add(lines as usize).min(self.overlay_max_position)
         } else {
             overlay.selected.saturating_sub(lines.unsigned_abs())
         };
@@ -253,11 +249,17 @@ impl App {
         }
     }
 
-    pub fn overlay_title(&self) -> Option<&'static str> {
-        match self.overlay.as_ref()?.kind {
-            OverlayKind::Help => Some("Help"),
-            OverlayKind::Info => Some("Document info"),
-            OverlayKind::Toc => Some("Table of contents"),
+    pub fn overlay_title(&self) -> Option<String> {
+        let overlay = self.overlay.as_ref()?;
+        match overlay.kind {
+            OverlayKind::Help => Some("Help".to_owned()),
+            OverlayKind::Info => Some("Document info".to_owned()),
+            OverlayKind::Toc => {
+                let total = self.loaded.as_ref().map_or(0, |loaded| loaded.document().toc().len());
+                let current =
+                    if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
+                Some(format!("Table of contents · {current}/{total}"))
+            }
         }
     }
 
@@ -269,10 +271,13 @@ impl App {
             OverlayKind::Help => vec![
                 "j/k or ↑/↓       scroll one line".to_owned(),
                 "Ctrl-d/Ctrl-u    scroll half a page".to_owned(),
-                "Space/b          scroll one page".to_owned(),
-                "g/G              start/end".to_owned(),
+                "Space/b or →/←   scroll one page".to_owned(),
+                "PgDn/PgUp        scroll one page".to_owned(),
+                "g/G or Home/End  start/end".to_owned(),
                 "[/]              previous/next chapter".to_owned(),
                 "/text, n/N       search".to_owned(),
+                ":toc             browse table of contents".to_owned(),
+                "Enter/Esc        jump/close an open TOC".to_owned(),
                 ":help            show this help".to_owned(),
                 ":q or Ctrl-C     quit".to_owned(),
             ],
@@ -339,8 +344,8 @@ impl App {
             KeyCode::Char('u') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll(-half_page)
             }
-            KeyCode::Char(' ') | KeyCode::PageDown => self.scroll(page),
-            KeyCode::Char('b') | KeyCode::PageUp => self.scroll(-page),
+            KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Right => self.scroll(page),
+            KeyCode::Char('b') | KeyCode::PageUp | KeyCode::Left => self.scroll(-page),
             KeyCode::Char('g') | KeyCode::Home => self.goto_start(),
             KeyCode::Char('G') | KeyCode::End => self.goto_end(),
             KeyCode::Char(']') => self.goto_chapter(true),
@@ -393,13 +398,6 @@ impl App {
         let half_page = (self.overlay_page_rows / 2).max(1);
         match event.code {
             KeyCode::Esc => return,
-            KeyCode::Char('j') | KeyCode::Down if overlay.kind == OverlayKind::Toc => {
-                let len = self.loaded.as_ref().map_or(0, |loaded| loaded.document().toc().len());
-                overlay.selected = (overlay.selected + 1).min(len.saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up if overlay.kind == OverlayKind::Toc => {
-                overlay.selected = overlay.selected.saturating_sub(1);
-            }
             KeyCode::Enter if overlay.kind == OverlayKind::Toc => {
                 let offset = self.loaded.as_ref().and_then(|loaded| {
                     loaded.document().toc().get(overlay.selected).map(|entry| entry.offset())
@@ -409,37 +407,32 @@ impl App {
                 }
                 return;
             }
-            KeyCode::Char('j') | KeyCode::Down if overlay.kind != OverlayKind::Toc => {
-                overlay.selected = overlay.selected.saturating_add(1).min(self.overlay_max_scroll);
+            KeyCode::Char('j') | KeyCode::Down => {
+                overlay.selected =
+                    overlay.selected.saturating_add(1).min(self.overlay_max_position);
             }
-            KeyCode::Char('k') | KeyCode::Up if overlay.kind != OverlayKind::Toc => {
+            KeyCode::Char('k') | KeyCode::Up => {
                 overlay.selected = overlay.selected.saturating_sub(1);
             }
-            KeyCode::Char('d')
-                if overlay.kind != OverlayKind::Toc
-                    && event.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('d') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                 overlay.selected =
-                    overlay.selected.saturating_add(half_page).min(self.overlay_max_scroll);
+                    overlay.selected.saturating_add(half_page).min(self.overlay_max_position);
             }
-            KeyCode::Char('u')
-                if overlay.kind != OverlayKind::Toc
-                    && event.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('u') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                 overlay.selected = overlay.selected.saturating_sub(half_page);
             }
-            KeyCode::Char(' ') | KeyCode::PageDown if overlay.kind != OverlayKind::Toc => {
+            KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Right => {
                 overlay.selected =
-                    overlay.selected.saturating_add(page).min(self.overlay_max_scroll);
+                    overlay.selected.saturating_add(page).min(self.overlay_max_position);
             }
-            KeyCode::Char('b') | KeyCode::PageUp if overlay.kind != OverlayKind::Toc => {
+            KeyCode::Char('b') | KeyCode::PageUp | KeyCode::Left => {
                 overlay.selected = overlay.selected.saturating_sub(page);
             }
-            KeyCode::Char('g') | KeyCode::Home if overlay.kind != OverlayKind::Toc => {
+            KeyCode::Char('g') | KeyCode::Home => {
                 overlay.selected = 0;
             }
-            KeyCode::Char('G') | KeyCode::End if overlay.kind != OverlayKind::Toc => {
-                overlay.selected = self.overlay_max_scroll;
+            KeyCode::Char('G') | KeyCode::End => {
+                overlay.selected = self.overlay_max_position;
             }
             _ => {}
         }
@@ -715,6 +708,18 @@ mod tests {
 
     use super::*;
 
+    fn app_with_text(text: &str) -> (tempfile::TempDir, App) {
+        let directory = tempfile::tempdir().unwrap();
+        let book = directory.path().join("book.txt");
+        fs::write(&book, text).unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let loaded =
+            open_document(DocumentSource::from_path(book), LoadOptions::default()).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+        app.install_document(loaded);
+        (directory, app)
+    }
+
     #[test]
     fn parses_open_path_without_splitting_spaces() {
         assert_eq!(
@@ -756,7 +761,7 @@ mod tests {
         let store = StateStore::at(directory.path().join("state")).unwrap();
         let mut app = App::new(directory.path().to_path_buf(), store);
         app.overlay = Some(OverlayState { kind: OverlayKind::Info, selected: 0 });
-        app.set_overlay_scroll_extent(20, 5);
+        app.set_overlay_layout(20, 5);
 
         app.scroll_mouse(3);
         assert_eq!(app.overlay().unwrap().selected, 3);
@@ -772,6 +777,92 @@ mod tests {
         assert_eq!(app.overlay().unwrap().selected, 14);
         app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(app.overlay().unwrap().selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 4);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn scrolls_toc_by_line_half_page_page_and_end_keys() {
+        let text = (1..=20)
+            .map(|number| format!("第{number}章 标题{number}\n正文。\n"))
+            .collect::<String>();
+        let (_directory, mut app) = app_with_text(&text);
+        assert_eq!(app.document().unwrap().document().toc().len(), 20);
+
+        app.overlay = Some(OverlayState { kind: OverlayKind::Toc, selected: 0 });
+        app.set_overlay_layout(20, 5);
+        assert_eq!(app.overlay_title().as_deref(), Some("Table of contents · 1/20"));
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 4);
+        assert_eq!(app.overlay_title().as_deref(), Some("Table of contents · 5/20"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.overlay().unwrap().selected, 6);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 10);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 19);
+        assert_eq!(app.overlay_title().as_deref(), Some("Table of contents · 20/20"));
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 19);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 15);
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.overlay().unwrap().selected, 13);
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn toc_layout_clamps_selection_and_enter_jumps_to_it() {
+        let text = (1..=4)
+            .map(|number| format!("第{number}章 标题{number}\n正文。\n"))
+            .collect::<String>();
+        let (_directory, mut app) = app_with_text(&text);
+        let target = app.document().unwrap().document().toc()[2].offset();
+        app.overlay = Some(OverlayState { kind: OverlayKind::Toc, selected: usize::MAX });
+
+        app.set_overlay_layout(3, 0);
+        assert_eq!(app.overlay().unwrap().selected, 2);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.overlay().unwrap().selected, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.overlay().is_none());
+        assert_eq!(app.viewport.as_ref().unwrap().anchor(), target);
+    }
+
+    #[test]
+    fn left_and_right_scroll_the_document_only_in_normal_mode() {
+        let text = (1..=20).map(|number| format!("line {number}\n")).collect::<String>();
+        let (_directory, mut app) = app_with_text(&text);
+        app.visible_lines(40, 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.viewport.as_ref().unwrap().anchor() > 0);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.viewport.as_ref().unwrap().anchor(), 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.viewport.as_ref().unwrap().anchor(), 0);
+    }
+
+    #[test]
+    fn help_lists_page_keys_and_toc_controls() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+        app.overlay = Some(OverlayState { kind: OverlayKind::Help, selected: 0 });
+        let help = app.overlay_items().join("\n");
+
+        assert!(help.contains("→/←"));
+        assert!(help.contains("PgDn/PgUp"));
+        assert!(help.contains("Enter/Esc"));
     }
 
     #[test]

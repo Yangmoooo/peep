@@ -121,34 +121,35 @@ fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
-    let Some((kind, selected)) = app.overlay().map(|overlay| (overlay.kind, overlay.selected))
-    else {
+    let Some(kind) = app.overlay().map(|overlay| overlay.kind) else {
         return;
     };
     let items = app.overlay_items();
-    let title = app.overlay_title().unwrap_or_default();
-    let desired_height = (items.len() as u16).saturating_add(2).max(3);
+    let desired_height = (items.len().min(u16::MAX as usize) as u16).saturating_add(2).max(3);
     let width = body.width.saturating_sub(4).clamp(10, 80);
     let height = desired_height.min(body.height.saturating_sub(1).max(3));
     let area = centered_rect(width, height, body);
     let palette = ui_palette();
     let surface_style = Style::default().fg(palette.text).bg(palette.surface);
+    frame.render_widget(Clear, area);
+
+    let wrapped_items = (kind != OverlayKind::Toc)
+        .then(|| wrap_overlay_items(&items, area.width.saturating_sub(2) as usize));
+    let total_rows = wrapped_items.as_ref().map_or(items.len(), Vec::len);
+    let viewport_rows = area.height.saturating_sub(2) as usize;
+    app.set_overlay_layout(total_rows, viewport_rows);
+    let title = app.overlay_title().unwrap_or_default();
     let overlay_block = || {
         Block::default()
-            .title(title)
+            .title(title.as_str())
             .title_style(Style::default().fg(palette.accent))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.muted))
             .style(surface_style)
     };
-    frame.render_widget(Clear, area);
 
-    if kind != OverlayKind::Toc {
-        let content_rows = wrap_overlay_items(&items, area.width.saturating_sub(2) as usize);
-        let total_rows = content_rows.len();
-        let viewport_rows = area.height.saturating_sub(2) as usize;
-        app.set_overlay_scroll_extent(total_rows, viewport_rows);
+    if let Some(content_rows) = wrapped_items {
         let scroll =
             app.overlay().map_or(0, |overlay| overlay.selected).min(u16::MAX as usize) as u16;
         let content = Text::from(content_rows.into_iter().map(Line::from).collect::<Vec<_>>());
@@ -176,6 +177,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
         return;
     }
 
+    let selected = app.overlay().map_or(0, |overlay| overlay.selected);
     let list_items = items.into_iter().map(ListItem::new).collect::<Vec<_>>();
     let list = List::new(list_items)
         .style(surface_style)
