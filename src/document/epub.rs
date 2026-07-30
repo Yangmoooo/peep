@@ -15,6 +15,17 @@ use super::{
 mod navigation;
 mod xhtml;
 
+const XML_NODE_LIMIT: u32 = 1_000_000;
+
+/// Accept DTD syntax used by legacy EPUBs without resolving external entities.
+fn restricted_xml_options<'input>() -> roxmltree::ParsingOptions<'input> {
+    roxmltree::ParsingOptions {
+        allow_dtd: true,
+        nodes_limit: XML_NODE_LIMIT,
+        entity_resolver: None,
+    }
+}
+
 pub(super) struct EpubAdapter;
 
 impl FormatAdapter for EpubAdapter {

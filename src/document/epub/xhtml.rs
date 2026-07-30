@@ -4,9 +4,7 @@ use ego_tree::NodeRef;
 use scraper::Html;
 use scraper::node::Node;
 
-use super::{TextStyle, TextStyleKind};
-
-const XML_NODE_LIMIT: u32 = 1_000_000;
+use super::{TextStyle, TextStyleKind, restricted_xml_options};
 
 #[derive(Debug)]
 pub(super) struct RenderedContent {
@@ -184,12 +182,8 @@ impl RenderSink {
 }
 
 pub(super) fn render(source: &str) -> RenderedContent {
-    let options = roxmltree::ParsingOptions {
-        allow_dtd: true,
-        nodes_limit: XML_NODE_LIMIT,
-        entity_resolver: None,
-    };
-    if let Ok(document) = roxmltree::Document::parse_with_options(source, options) {
+    if let Ok(document) = roxmltree::Document::parse_with_options(source, restricted_xml_options())
+    {
         let mut sink = RenderSink::default();
         walk_xml(document.root(), &mut sink);
         return sink.finish();

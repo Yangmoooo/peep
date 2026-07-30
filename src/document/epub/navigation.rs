@@ -4,11 +4,15 @@ use percent_encoding::percent_decode_str;
 use scraper::node::Node;
 use scraper::{Html, Selector};
 
-use super::super::toc_label_is_landmark;
+use super::super::toc::{label_is_landmark, labels_compatible};
 use super::{
     AssembledDocument, TocEntry, archive_parent, collapse_whitespace, detect_chapter_headings,
-    normalise_archive_name, normalise_relative_archive_path,
+    normalise_archive_name, normalise_relative_archive_path, restricted_xml_options,
 };
+
+const USABLE_NAV_COVERAGE_PERCENT: usize = 70;
+const FRAGMENT_TEXT_LOOKAHEAD_CHARS: usize = 128;
+const ANCHOR_HEADING_MAX_DISTANCE_BYTES: usize = 128;
 
 #[derive(Clone, Debug)]
 pub(super) struct RawTocEntry {
@@ -30,12 +34,8 @@ pub(super) struct ResolvedToc {
 }
 
 pub(super) fn parse_nav(source: &str, nav_path: &str) -> Vec<RawTocEntry> {
-    let options = roxmltree::ParsingOptions {
-        allow_dtd: true,
-        nodes_limit: 1_000_000,
-        entity_resolver: None,
-    };
-    if let Ok(document) = roxmltree::Document::parse_with_options(source, options) {
+    if let Ok(document) = roxmltree::Document::parse_with_options(source, restricted_xml_options())
+    {
         return parse_xml_nav(&document, nav_path);
     }
 
@@ -117,12 +117,8 @@ fn parse_xml_nav(document: &roxmltree::Document<'_>, nav_path: &str) -> Vec<RawT
 }
 
 pub(super) fn parse_ncx(source: &str, ncx_path: &str) -> Vec<RawTocEntry> {
-    let options = roxmltree::ParsingOptions {
-        allow_dtd: true,
-        nodes_limit: 1_000_000,
-        entity_resolver: None,
-    };
-    let Ok(document) = roxmltree::Document::parse_with_options(source, options) else {
+    let Ok(document) = roxmltree::Document::parse_with_options(source, restricted_xml_options())
+    else {
         return Vec::new();
     };
     document
@@ -194,8 +190,8 @@ pub(super) fn choose_best(candidates: impl IntoIterator<Item = ResolvedToc>) -> 
 fn compare_quality(left: &ResolvedToc, right: &ResolvedToc) -> Ordering {
     let left_coverage = coverage(left);
     let right_coverage = coverage(right);
-    let left_usable = left_coverage >= 70;
-    let right_usable = right_coverage >= 70;
+    let left_usable = left_coverage >= USABLE_NAV_COVERAGE_PERCENT;
+    let right_usable = right_coverage >= USABLE_NAV_COVERAGE_PERCENT;
     left_usable
         .cmp(&right_usable)
         .then_with(|| left.entries.len().cmp(&right.entries.len()))
@@ -251,7 +247,7 @@ fn resolve_entry(
         return global_headings.first().copied();
     }
 
-    if toc_label_is_landmark(&entry.label)
+    if label_is_landmark(&entry.label)
         && let Some(section) = section
     {
         return entry
@@ -290,7 +286,10 @@ fn target_matches_label(
     offset: usize,
     label: &str,
 ) -> bool {
-    let sample = assembled.text[offset..section.range.end].chars().take(128).collect::<String>();
+    let sample = assembled.text[offset..section.range.end]
+        .chars()
+        .take(FRAGMENT_TEXT_LOOKAHEAD_CHARS)
+        .collect::<String>();
     if sample
         .lines()
         .map(str::trim)
@@ -301,7 +300,7 @@ fn target_matches_label(
     }
     if let Some(nearest_distance) =
         section.headings.iter().map(|heading| heading.offset.abs_diff(offset)).min()
-        && nearest_distance <= 128
+        && nearest_distance <= ANCHOR_HEADING_MAX_DISTANCE_BYTES
     {
         return section.headings.iter().any(|heading| {
             heading.offset.abs_diff(offset) == nearest_distance
@@ -309,22 +308,6 @@ fn target_matches_label(
         });
     }
     false
-}
-
-fn labels_compatible(left: &str, right: &str) -> bool {
-    let left = semantic_key(left);
-    let right = semantic_key(right);
-    left == right
-        || (left.chars().count() >= 2 && right.starts_with(&left))
-        || (right.chars().count() >= 2 && left.starts_with(&right))
-}
-
-fn semantic_key(label: &str) -> String {
-    label
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn parse_target(document_path: &str, href: &str) -> Option<EpubTarget> {

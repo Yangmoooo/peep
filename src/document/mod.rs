@@ -6,6 +6,7 @@
 
 mod chapter;
 mod epub;
+mod toc;
 mod txt;
 
 use std::fs::File;
@@ -164,14 +165,15 @@ impl CanonicalDocument {
             entry.offset < text_len
                 && text.is_char_boundary(entry.offset)
                 && !entry.label.trim().is_empty()
-                && (toc_label_is_landmark(&entry.label) || toc_label_is_visible(&text, entry))
+                && (toc::label_is_landmark(&entry.label)
+                    || toc::label_is_visible_at(&text, &entry.label, entry.offset))
         });
         toc.sort_by_key(|entry| entry.offset);
         toc = toc.into_iter().fold(Vec::<TocEntry>::new(), |mut entries, entry| {
             let keep = entries.last().is_none_or(|previous| {
                 previous.offset != entry.offset
                     || previous.depth != entry.depth
-                    || toc_labels_compatible(&previous.label, &entry.label)
+                    || toc::labels_compatible(&previous.label, &entry.label)
             });
             if keep {
                 entries.push(entry);
@@ -186,45 +188,6 @@ impl CanonicalDocument {
         });
         Self { total_chars: text.chars().count(), text, metadata, sections, toc, styles }
     }
-}
-
-fn toc_label_is_visible(text: &str, entry: &TocEntry) -> bool {
-    let visible_line = text[entry.offset..]
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
-    let label = toc_semantic_key(&entry.label);
-    let visible = toc_semantic_key(visible_line);
-    !label.is_empty()
-        && (label == visible
-            || (label.chars().count() >= 2 && visible.contains(&label))
-            || (visible.chars().count() >= 2 && label.contains(&visible)))
-}
-
-fn toc_labels_compatible(left: &str, right: &str) -> bool {
-    let left = toc_semantic_key(left);
-    let right = toc_semantic_key(right);
-    left == right
-        || (left.chars().count() >= 2 && right.starts_with(&left))
-        || (right.chars().count() >= 2 && left.starts_with(&right))
-}
-
-pub(crate) fn toc_label_is_landmark(label: &str) -> bool {
-    let key = toc_semantic_key(label);
-    matches!(
-        key.as_str(),
-        "目录" | "目錄" | "封面" | "扉页" | "扉頁" | "书名页" | "書名頁" | "copyright"
-    ) || key.starts_with("版权")
-        || key.starts_with("版權")
-}
-
-fn toc_semantic_key(label: &str) -> String {
-    label
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
