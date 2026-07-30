@@ -128,7 +128,7 @@ mod imp {
         // SAFETY: querying the process standard output handle does not transfer
         // ownership.
         let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        if output == 0 || output == INVALID_HANDLE_VALUE {
+        if output.is_null() || output == INVALID_HANDLE_VALUE {
             return None;
         }
         // SAFETY: the structure is initialized with its required size before the API
