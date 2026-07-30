@@ -3,10 +3,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
-use ego_tree::NodeRef;
 use percent_encoding::percent_decode_str;
-use scraper::node::Node;
-use scraper::{Html, Selector};
 use zip::ZipArchive;
 
 use super::{
@@ -14,6 +11,9 @@ use super::{
     FormatAdapter, LoadError, LoadWarning, Section, TextStyle, TextStyleKind, TocEntry,
     detect_chapter_headings,
 };
+
+mod navigation;
+mod xhtml;
 
 pub(super) struct EpubAdapter;
 
@@ -117,42 +117,29 @@ impl FormatAdapter for EpubAdapter {
             &package.metadata,
             input.limits.max_text_bytes,
         )?;
-        warnings.extend(assembled.warnings);
+        warnings.extend(assembled.warnings.iter().cloned());
 
-        let mut toc = package
-            .nav_path
-            .as_deref()
-            .and_then(|path| {
-                archive
-                    .read_text(path, 8 * 1024 * 1024)
-                    .ok()
-                    .flatten()
-                    .map(|html| parse_nav_document(&html, path, &assembled.path_offsets))
-            })
-            .unwrap_or_default();
-        if toc.is_empty() {
-            toc = package
+        let nav_toc =
+            package
+                .nav_path
+                .as_deref()
+                .and_then(|path| {
+                    archive.read_text(path, 8 * 1024 * 1024).ok().flatten().map(|html| {
+                        navigation::resolve(navigation::parse_nav(&html, path), &assembled)
+                    })
+                })
+                .unwrap_or_default();
+        let ncx_toc =
+            package
                 .ncx_path
                 .as_deref()
                 .and_then(|path| {
-                    archive
-                        .read_text(path, 8 * 1024 * 1024)
-                        .ok()
-                        .flatten()
-                        .map(|xml| parse_ncx(&xml, path, &assembled.path_offsets))
+                    archive.read_text(path, 8 * 1024 * 1024).ok().flatten().map(|xml| {
+                        navigation::resolve(navigation::parse_ncx(&xml, path), &assembled)
+                    })
                 })
                 .unwrap_or_default();
-        }
-        // When Calibre filepos fragments are stripped every entry
-        // within a file lands on the same byte offset.  Try to
-        // recover by searching the assembled text for each entry's
-        // label so that the quality check below sees distinct offsets.
-        if toc_has_collapsed_offsets(&toc) {
-            toc = resolve_toc_by_labels(toc, &assembled.text);
-            if toc_has_collapsed_offsets(&toc) {
-                toc.clear();
-            }
-        }
+        let mut toc = navigation::choose_best([nav_toc, ncx_toc]);
         if toc.is_empty() {
             toc = assembled.heading_toc;
             if !toc.is_empty() {
@@ -395,8 +382,15 @@ struct AssembledDocument {
     sections: Vec<Section>,
     styles: Vec<TextStyle>,
     heading_toc: Vec<TocEntry>,
-    path_offsets: HashMap<String, usize>,
+    rendered_sections: Vec<RenderedSection>,
     warnings: Vec<LoadWarning>,
+}
+
+struct RenderedSection {
+    path: String,
+    range: std::ops::Range<usize>,
+    anchors: HashMap<String, usize>,
+    headings: Vec<xhtml::RenderedHeading>,
 }
 
 fn assemble_document(
@@ -409,7 +403,7 @@ fn assemble_document(
     let mut sections = Vec::new();
     let mut styles = Vec::new();
     let mut heading_toc = Vec::new();
-    let mut path_offsets = HashMap::new();
+    let mut rendered_sections = Vec::new();
     let mut warnings = Vec::new();
 
     for path in paths {
@@ -420,7 +414,7 @@ fn assemble_document(
             ));
             continue;
         };
-        let rendered = render_html(&html);
+        let rendered = xhtml::render(&html);
         if rendered.text.trim().is_empty() {
             continue;
         }
@@ -429,7 +423,6 @@ fn assemble_document(
             ensure_newlines(&mut text, 2);
         }
         let start = text.len();
-        path_offsets.insert(normalise_archive_name(path), start);
         text.push_str(&rendered.text);
         if text.len() > text_limit {
             return Err(LoadError::TextTooLarge { limit: text_limit });
@@ -448,17 +441,33 @@ fn assemble_document(
             style.range.end += start;
             style
         }));
-        heading_toc.extend(rendered.headings.into_iter().map(|heading| TocEntry {
-            label: heading.label,
-            offset: start + heading.offset,
+        let headings = rendered
+            .headings
+            .into_iter()
+            .map(|mut heading| {
+                heading.offset += start;
+                heading
+            })
+            .collect::<Vec<_>>();
+        heading_toc.extend(headings.iter().map(|heading| TocEntry {
+            label: heading.label.clone(),
+            offset: heading.offset,
             depth: heading.depth,
         }));
+        let anchors =
+            rendered.anchors.into_iter().map(|(name, offset)| (name, start + offset)).collect();
+        rendered_sections.push(RenderedSection {
+            path: normalise_archive_name(path),
+            range: start..end,
+            anchors,
+            headings,
+        });
     }
 
     if sections.is_empty() {
         return Err(LoadError::InvalidEpub("the EPUB contains no readable text".to_owned()));
     }
-    Ok(AssembledDocument { text, sections, styles, heading_toc, path_offsets, warnings })
+    Ok(AssembledDocument { text, sections, styles, heading_toc, rendered_sections, warnings })
 }
 
 fn load_without_package(
@@ -498,242 +507,6 @@ fn load_without_package(
         ),
         warnings,
     })
-}
-
-#[derive(Debug)]
-struct RenderedHtml {
-    text: String,
-    styles: Vec<TextStyle>,
-    headings: Vec<RenderedHeading>,
-}
-
-#[derive(Debug)]
-struct RenderedHeading {
-    label: String,
-    offset: usize,
-    depth: u8,
-}
-
-#[derive(Default)]
-struct HtmlRenderer {
-    text: String,
-    styles: Vec<TextStyle>,
-    headings: Vec<RenderedHeading>,
-    pending_space: bool,
-    pre_depth: usize,
-}
-
-impl HtmlRenderer {
-    fn walk(&mut self, node: NodeRef<'_, Node>) {
-        match node.value() {
-            Node::Text(text) => self.push_text(text),
-            Node::Element(element) => {
-                let name = element.name();
-                if matches!(name, "head" | "script" | "style" | "noscript" | "svg" | "nav") {
-                    return;
-                }
-                if name == "br" {
-                    self.ensure_newlines(1);
-                    return;
-                }
-                if name == "img" {
-                    self.push_literal("[Image]");
-                    return;
-                }
-
-                let heading_level = heading_level(name);
-                let paragraph_block =
-                    matches!(name, "p" | "blockquote" | "pre" | "li") || heading_level.is_some();
-                if paragraph_block {
-                    self.ensure_newlines(2);
-                } else if name == "tr" {
-                    self.ensure_newlines(1);
-                }
-                if name == "li" {
-                    self.push_literal("- ");
-                }
-
-                let style_start = self.text.len();
-                if name == "pre" {
-                    self.pre_depth += 1;
-                }
-                for child in node.children() {
-                    self.walk(child);
-                }
-                if name == "pre" {
-                    self.pre_depth = self.pre_depth.saturating_sub(1);
-                }
-                let style_end = self.text.len();
-
-                let style_kind = match name {
-                    "em" | "i" => Some(TextStyleKind::Emphasis),
-                    "strong" | "b" => Some(TextStyleKind::Strong),
-                    _ => heading_level.map(TextStyleKind::Heading),
-                };
-                if let Some(kind) = style_kind
-                    && style_start < style_end
-                {
-                    self.styles.push(TextStyle { range: style_start..style_end, kind });
-                }
-                if let Some(depth) = heading_level {
-                    let label = self.text[style_start..style_end].trim().to_owned();
-                    if !label.is_empty() {
-                        self.headings.push(RenderedHeading { label, offset: style_start, depth });
-                    }
-                }
-
-                if matches!(name, "td" | "th") {
-                    self.push_literal("\t");
-                }
-                if paragraph_block {
-                    self.ensure_newlines(2);
-                } else if name == "tr" {
-                    self.ensure_newlines(1);
-                }
-            }
-            _ => {
-                for child in node.children() {
-                    self.walk(child);
-                }
-            }
-        }
-    }
-
-    fn push_text(&mut self, value: &str) {
-        if self.pre_depth > 0 {
-            self.text.push_str(&value.replace("\r\n", "\n").replace('\r', "\n"));
-            return;
-        }
-        for character in value.chars() {
-            if character.is_whitespace() {
-                self.pending_space = true;
-                continue;
-            }
-            if self.pending_space
-                && !self.text.is_empty()
-                && !self.text.ends_with(['\n', '\t', ' '])
-            {
-                self.text.push(' ');
-            }
-            self.pending_space = false;
-            self.text.push(character);
-        }
-    }
-
-    fn push_literal(&mut self, value: &str) {
-        if self.pending_space && !self.text.is_empty() && !self.text.ends_with(['\n', '\t', ' ']) {
-            self.text.push(' ');
-        }
-        self.pending_space = false;
-        self.text.push_str(value);
-    }
-
-    fn ensure_newlines(&mut self, count: usize) {
-        self.pending_space = false;
-        while self.text.ends_with([' ', '\t']) {
-            self.text.pop();
-        }
-        if self.text.is_empty() {
-            return;
-        }
-        let existing = self.text.chars().rev().take_while(|character| *character == '\n').count();
-        for _ in existing..count {
-            self.text.push('\n');
-        }
-    }
-
-    fn finish(mut self) -> RenderedHtml {
-        while self.text.ends_with(char::is_whitespace) {
-            self.text.pop();
-        }
-        let len = self.text.len();
-        for style in &mut self.styles {
-            style.range.end = style.range.end.min(len);
-        }
-        self.styles.retain(|style| style.range.start < style.range.end);
-        self.headings.retain(|heading| heading.offset < len);
-        RenderedHtml { text: self.text, styles: self.styles, headings: self.headings }
-    }
-}
-
-fn render_html(source: &str) -> RenderedHtml {
-    let document = Html::parse_document(source);
-    let mut renderer = HtmlRenderer::default();
-    renderer.walk(document.tree.root());
-    renderer.finish()
-}
-
-fn heading_level(name: &str) -> Option<u8> {
-    match name {
-        "h1" => Some(1),
-        "h2" => Some(2),
-        "h3" => Some(3),
-        "h4" => Some(4),
-        "h5" => Some(5),
-        "h6" => Some(6),
-        _ => None,
-    }
-}
-
-fn parse_nav_document(
-    source: &str,
-    nav_path: &str,
-    path_offsets: &HashMap<String, usize>,
-) -> Vec<TocEntry> {
-    let document = Html::parse_document(source);
-    let nav_selector = Selector::parse("nav").expect("static selector");
-    let link_selector = Selector::parse("a[href]").expect("static selector");
-    let nav = document
-        .select(&nav_selector)
-        .find(|element| {
-            element.value().attrs().any(|(name, value)| {
-                name.ends_with("type") && value.split_whitespace().any(|part| part == "toc")
-            })
-        })
-        .or_else(|| document.select(&nav_selector).next());
-    let Some(nav) = nav else {
-        return Vec::new();
-    };
-
-    nav.select(&link_selector)
-        .filter_map(|link| {
-            let href = link.value().attr("href")?;
-            let path = normalise_relative_archive_path(archive_parent(nav_path), href)?;
-            let offset = *path_offsets.get(&path)?;
-            let label = collapse_whitespace(&link.text().collect::<String>());
-            (!label.is_empty()).then_some(TocEntry { label, offset, depth: 0 })
-        })
-        .collect()
-}
-
-fn parse_ncx(source: &str, ncx_path: &str, path_offsets: &HashMap<String, usize>) -> Vec<TocEntry> {
-    let Ok(document) = roxmltree::Document::parse(source) else {
-        return Vec::new();
-    };
-    document
-        .descendants()
-        .filter(|node| node.is_element() && node.tag_name().name() == "navPoint")
-        .filter_map(|point| {
-            let label = point
-                .descendants()
-                .find(|node| node.is_element() && node.tag_name().name() == "text")?
-                .text()
-                .map(collapse_whitespace)?;
-            let href = point
-                .descendants()
-                .find(|node| node.is_element() && node.tag_name().name() == "content")?
-                .attribute("src")?;
-            let path = normalise_relative_archive_path(archive_parent(ncx_path), href)?;
-            let offset = *path_offsets.get(&path)?;
-            let depth = point
-                .ancestors()
-                .filter(|node| node.is_element() && node.tag_name().name() == "navPoint")
-                .count()
-                .saturating_sub(1)
-                .min(u8::MAX as usize) as u8;
-            Some(TocEntry { label, offset, depth })
-        })
-        .collect()
 }
 
 fn normalise_relative_archive_path(base: &str, href: &str) -> Option<String> {
@@ -837,36 +610,6 @@ fn digit_end(bytes: &[u8], start: usize) -> usize {
     end
 }
 
-fn resolve_toc_by_labels(toc: Vec<TocEntry>, text: &str) -> Vec<TocEntry> {
-    toc.into_iter()
-        .map(|mut entry| {
-            // Use rfind so that when the label appears both in a
-            // leading TOC page and later in the actual chapter body
-            // the TOC entry points to the chapter, not the TOC.
-            if let Some(found) = text.rfind(entry.label()) {
-                entry.offset = found;
-            }
-            entry
-        })
-        .collect()
-}
-
-fn toc_has_collapsed_offsets(toc: &[TocEntry]) -> bool {
-    if toc.len() <= 1 {
-        return toc.is_empty();
-    }
-    let unique: std::collections::HashSet<usize> =
-        toc.iter().map(|entry| entry.offset()).collect();
-    // Every entry landing on the same byte is a sure sign of
-    // fragment stripping.
-    if unique.len() == 1 {
-        return true;
-    }
-    // When fewer than half the entries have distinct offsets and
-    // there are at least 5 entries, the NCX has lost information.
-    unique.len() * 2 < toc.len() && toc.len() >= 5
-}
-
 fn trim_zeroes(bytes: &[u8]) -> &[u8] {
     let first_nonzero =
         bytes.iter().position(|byte| *byte != b'0').unwrap_or(bytes.len().saturating_sub(1));
@@ -884,7 +627,7 @@ mod tests {
 
     #[test]
     fn renders_html_blocks_images_and_styles() {
-        let rendered = render_html(
+        let rendered = xhtml::render(
             "<html><body><h1>第一章</h1><p>Hello <em>world</em>.</p><p><img/></p></body></html>",
         );
         assert_eq!(rendered.text, "第一章\n\nHello world.\n\n[Image]");
@@ -1003,56 +746,6 @@ mod tests {
     #[test]
     fn natural_sort_orders_numeric_segments() {
         assert_eq!(natural_cmp("chapter2.xhtml", "chapter10.xhtml"), Ordering::Less);
-    }
-
-    #[test]
-    fn collapsed_toc_detects_stripped_fragments() {
-        let entries =
-            vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }, TocEntry { label: "b".into(), offset: 100, depth: 0 }];
-        assert!(toc_has_collapsed_offsets(&entries));
-    }
-
-    #[test]
-    fn collapsed_toc_passes_valid_toc() {
-        let entries =
-            vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }, TocEntry { label: "b".into(), offset: 200, depth: 0 }];
-        assert!(!toc_has_collapsed_offsets(&entries));
-    }
-
-    #[test]
-    fn collapsed_toc_returns_false_for_single_entry() {
-        let entries = vec![TocEntry { label: "a".into(), offset: 100, depth: 0 }];
-        assert!(!toc_has_collapsed_offsets(&entries));
-    }
-
-    #[test]
-    fn collapsed_toc_with_ratio_triggers() {
-        // 6 entries, 3 unique → 3*2=6, 6<6 is false, but 6>=5
-        // Wait: 6 entries, 2 unique → 2*2=4 < 6 → collapsed
-        let entries = vec![
-            TocEntry { label: "a".into(), offset: 100, depth: 0 },
-            TocEntry { label: "b".into(), offset: 100, depth: 0 },
-            TocEntry { label: "c".into(), offset: 100, depth: 0 },
-            TocEntry { label: "d".into(), offset: 200, depth: 0 },
-            TocEntry { label: "e".into(), offset: 200, depth: 0 },
-            TocEntry { label: "f".into(), offset: 200, depth: 0 },
-        ];
-        assert!(toc_has_collapsed_offsets(&entries));
-    }
-
-    #[test]
-    fn resolve_toc_by_labels_uses_last_occurrence() {
-        // TOC page lists "第一章" first, actual chapter comes later.
-        // rfind picks the last (actual chapter) position.
-        let entries = vec![
-            TocEntry { label: "第一章".into(), offset: 0, depth: 0 },
-            TocEntry { label: "第二章".into(), offset: 0, depth: 0 },
-        ];
-        let text = "目录 第一章 第二章\n第一章 开始\n第二章 继续\n";
-        let resolved = resolve_toc_by_labels(entries, text);
-        // Both should find the later occurrence (actual chapters, not TOC)
-        assert!(resolved[0].offset() > 10); // after the TOC line
-        assert!(resolved[1].offset() > resolved[0].offset());
     }
 
     fn make_epub(entries: &[(&str, &str)]) -> Vec<u8> {
