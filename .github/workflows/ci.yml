@@ -62,3 +62,18 @@ jobs:
 
       - name: Clippy
         run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --locked --all-targets

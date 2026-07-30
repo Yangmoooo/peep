@@ -7,7 +7,7 @@ Peep 是一个本地、离线的终端 EPUB/TXT 阅读器。界面保持为克�
 - EPUB spine、目录和容错恢复。
 - UTF-8、UTF-8 BOM 与 GB18030 TXT。
 - 连续滚动、Unicode 宽度感知折行和稳定阅读位置。
-- Vim 风格导航、全文字面搜索和 EPUB 章节跳转。
+- Vim 风格导航、全文字面搜索和章节跳转。
 - 自动保存进度；文件仅改名或移动时通过 BLAKE3 恢复。
 - macOS、Linux 和 Windows Terminal。
 - 完全离线，无模型调用、遥测或远程 EPUB 资源加载。
@@ -29,6 +29,12 @@ cargo install --path .
 peep path/to/book.epub
 ```
 
+或直接安装 Git tag 对应的版本：
+
+```bash
+cargo install --git https://github.com/Yangmoooo/peep --tag v0.1.0 --locked
+```
+
 不带参数运行会恢复最近阅读的文件：
 
 ```bash
@@ -47,9 +53,9 @@ peep --no-mouse book.txt
 | --- | --- |
 | `j` / `k`、`↑` / `↓` | 上下滚动一行 |
 | `Ctrl-d` / `Ctrl-u` | 上下滚动半页 |
-| `Space` / `b` | 上下滚动一页 |
-| `g` / `G` | 文档开头/结尾 |
-| `]` / `[` | EPUB 下一章/上一章 |
+| `Space` / `b`、`→` / `←`、`PageDown` / `PageUp` | 下/上滚动一页 |
+| `g` / `G`、`Home` / `End` | 文档开头/结尾 |
+| `]` / `[` | 下一章/上一章 |
 | `/text` | 搜索普通文本 |
 | `n` / `N` | 下一个/上一个搜索结果 |
 | `Ctrl-C` | 退出 |
@@ -58,14 +64,16 @@ peep --no-mouse book.txt
 
 ```text
 :e <path>       打开文件
-:toc            EPUB 目录
+:toc            目录
 :goto <percent> 跳到百分比位置
 :info           文件和恢复警告
 :help           快捷键帮助
 :q              退出
 ```
 
-在信息和帮助浮窗中，可使用 `j/k`、方向键、PageUp/PageDown、Home/End 滚动。
+所有浮窗都支持 `j/k`、方向键、`Ctrl-d/Ctrl-u`、`Space/b`、
+`PageUp/PageDown` 和 `Home/End` 导航。目录浮窗还可用 `Enter` 跳转到所选章节，
+用 `Esc` 关闭。
 
 启用鼠标捕获时，大多数终端使用 `Shift` + 拖动进行原生文本选择。
 
@@ -73,7 +81,9 @@ peep --no-mouse book.txt
 
 Peep 面向普通 reflowable EPUB，不支持 DRM 和固定版式 EPUB。若 container、OPF、spine 或目录缺失，会在可安全判断时按文件和标题恢复，并通过 `:info` 显示 warning。
 
-TXT 保留原始换行，当前不推断章节。解码后的纯文本在 100 MiB 内属于正式支持范围，更大文件尽力运行。
+TXT 保留原始换行，并以严格的行首规则识别 `第N章/回`、`第N卷/部/集` 和复合卷章结构；
+普通正文中的内嵌编号不会被当作章节。解码后的纯文本在 100 MiB 内属于正式支持范围，
+更大文件尽力运行。
 
 ## 本地状态
 
