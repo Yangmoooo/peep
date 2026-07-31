@@ -12,7 +12,7 @@ use ratatui::widgets::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, InputMode, OverlayKind};
+use crate::app::{App, InputMode};
 use crate::document::{CanonicalDocument, TextStyleKind};
 use crate::terminal_palette;
 use crate::terminal_palette::DefaultColors;
@@ -133,7 +133,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
     let surface_style = Style::default().fg(palette.text).bg(palette.surface);
     frame.render_widget(Clear, area);
 
-    let wrapped_items = (kind != OverlayKind::Toc)
+    let wrapped_items = (!kind.is_list())
         .then(|| wrap_overlay_items(&items, area.width.saturating_sub(2) as usize));
     let total_rows = wrapped_items.as_ref().map_or(items.len(), Vec::len);
     let viewport_rows = area.height.saturating_sub(2) as usize;
@@ -178,7 +178,35 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
     }
 
     let selected = app.overlay().map_or(0, |overlay| overlay.selected);
-    let list_items = items.into_iter().map(ListItem::new).collect::<Vec<_>>();
+    let emphasis = (0..items.len()).map(|index| app.overlay_item_emphasis(index));
+    let list_items = items
+        .into_iter()
+        .zip(emphasis)
+        .map(|(item, emphasis)| {
+            let Some(range) = emphasis.filter(|range| {
+                range.start < range.end
+                    && range.end <= item.len()
+                    && item.is_char_boundary(range.start)
+                    && item.is_char_boundary(range.end)
+            }) else {
+                return ListItem::new(item);
+            };
+            let before = item[..range.start].to_owned();
+            let matched = item[range.clone()].to_owned();
+            let after = item[range.end..].to_owned();
+            ListItem::new(Line::from(vec![
+                Span::raw(before),
+                Span::styled(
+                    matched,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(after),
+            ]))
+        })
+        .collect::<Vec<_>>();
     let list = List::new(list_items)
         .style(surface_style)
         .block(overlay_block())

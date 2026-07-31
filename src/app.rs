@@ -9,11 +9,18 @@ use directories::UserDirs;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::{DocumentSource, LoadOptions, LoadedDocument, open_document};
-use crate::search::{SearchDirection, find_literal};
-use crate::state::StateStore;
+use crate::search::{
+    SearchAnalysis, SearchDirection, SearchError, SearchHit, SearchKind, SearchQuery, analyze,
+    find_next,
+};
+use crate::state::{Bookmark, RecentBook, StateStore, StateWarning, now_unix_ms};
 use crate::viewport::{Viewport, VisualLine};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
+const BOOKMARK_LABEL_LIMIT: usize = 120;
+const RECENT_BOOK_LIMIT: usize = 100;
+const SEARCH_PREVIEW_LIMIT: usize = 200;
+const SEARCH_CONTEXT_WIDTH: usize = 72;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMode {
@@ -27,6 +34,15 @@ pub enum OverlayKind {
     Help,
     Info,
     Toc,
+    Bookmarks,
+    Recent,
+    SearchResults,
+}
+
+impl OverlayKind {
+    pub fn is_list(self) -> bool {
+        matches!(self, Self::Toc | Self::Bookmarks | Self::Recent | Self::SearchResults)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -45,7 +61,10 @@ pub struct App {
     pub(crate) message: Option<String>,
     pub(crate) loading_path: Option<PathBuf>,
     pub(crate) current_match: Option<Range<usize>>,
-    pub(crate) search_query: Option<String>,
+    search_session: Option<SearchSession>,
+    bookmarks: Vec<Bookmark>,
+    recent_books: Vec<RecentBook>,
+    state_warnings: Vec<StateWarning>,
     store: StateStore,
     load_options: LoadOptions,
     load_task: Option<(u64, mpsc::Receiver<LoadTaskResult>)>,
@@ -67,7 +86,25 @@ struct LoadTaskResult {
 
 struct SearchTaskResult {
     generation: u64,
-    found: Option<Range<usize>>,
+    payload: SearchTaskPayload,
+}
+
+enum SearchTaskPayload {
+    Analyze { query: SearchQuery, result: Result<SearchAnalysis, SearchError> },
+    Step { direction: SearchDirection, result: Result<Option<Range<usize>>, SearchError> },
+}
+
+#[derive(Clone, Debug)]
+struct SearchSession {
+    query: SearchQuery,
+    current: Option<SearchHit>,
+    total: usize,
+    previews: Vec<SearchHit>,
+}
+
+struct SearchContext {
+    text: String,
+    emphasis: Range<usize>,
 }
 
 impl App {
@@ -82,7 +119,10 @@ impl App {
             message: None,
             loading_path: None,
             current_match: None,
-            search_query: None,
+            search_session: None,
+            bookmarks: Vec::new(),
+            recent_books: Vec::new(),
+            state_warnings: Vec::new(),
             store,
             load_options: LoadOptions::default(),
             load_task: None,
@@ -112,9 +152,12 @@ impl App {
 
     pub fn set_overlay_layout(&mut self, content_rows: usize, viewport_rows: usize) {
         self.overlay_page_rows = viewport_rows.max(1);
-        self.overlay_max_position = self.overlay.as_ref().map_or(0, |overlay| match overlay.kind {
-            OverlayKind::Toc => content_rows.saturating_sub(1),
-            OverlayKind::Help | OverlayKind::Info => content_rows.saturating_sub(viewport_rows),
+        self.overlay_max_position = self.overlay.as_ref().map_or(0, |overlay| {
+            if overlay.kind.is_list() {
+                content_rows.saturating_sub(1)
+            } else {
+                content_rows.saturating_sub(viewport_rows)
+            }
         });
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.selected = overlay.selected.min(self.overlay_max_position);
@@ -139,6 +182,9 @@ impl App {
         self.message = None;
         self.overlay = None;
         self.current_match = None;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_task = None;
+        self.search_session = None;
     }
 
     pub fn poll_tasks(&mut self) {
@@ -160,17 +206,13 @@ impl App {
         if let Some(task) = search_result {
             self.search_task = None;
             if task.generation == self.search_generation {
-                if let Some(found) = task.found {
-                    if let (Some(loaded), Some(viewport)) =
-                        (self.loaded.as_ref(), self.viewport.as_mut())
-                    {
-                        viewport.goto_byte(loaded.document().text(), found.start);
-                        self.current_match = Some(found);
-                        self.message = None;
-                        self.mark_moved();
+                match task.payload {
+                    SearchTaskPayload::Analyze { query, result } => {
+                        self.finish_search_analysis(query, result);
                     }
-                } else {
-                    self.message = Some("No matches".to_owned());
+                    SearchTaskPayload::Step { direction, result } => {
+                        self.finish_search_step(direction, result);
+                    }
                 }
             }
         }
@@ -260,6 +302,26 @@ impl App {
                     if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
                 Some(format!("Table of contents · {current}/{total}"))
             }
+            OverlayKind::Bookmarks => {
+                let total = self.bookmarks.len();
+                let current =
+                    if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
+                Some(format!("Bookmarks · {current}/{total}"))
+            }
+            OverlayKind::Recent => {
+                let total = self.recent_books.len();
+                let current =
+                    if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
+                Some(format!("Recent books · {current}/{total}"))
+            }
+            OverlayKind::SearchResults => {
+                let session = self.search_session.as_ref()?;
+                let current = session
+                    .previews
+                    .get(overlay.selected)
+                    .map_or(0, |hit| hit.ordinal.saturating_add(1));
+                Some(format!("Search results · {current}/{}", session.total))
+            }
         }
     }
 
@@ -276,8 +338,12 @@ impl App {
                 "g/G or Home/End  start/end".to_owned(),
                 "[/]              previous/next chapter".to_owned(),
                 "/text, n/N       search".to_owned(),
+                ":exact/:re       exact/regex search".to_owned(),
+                ":results         browse search results".to_owned(),
                 ":toc             browse table of contents".to_owned(),
-                "Enter/Esc        jump/close an open TOC".to_owned(),
+                ":mark/:marks     add/browse bookmarks".to_owned(),
+                ":recent          browse recent books".to_owned(),
+                "Enter/Esc        jump/close a list".to_owned(),
                 ":help            show this help".to_owned(),
                 ":q or Ctrl-C     quit".to_owned(),
             ],
@@ -296,25 +362,59 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default(),
+            OverlayKind::Bookmarks => self.bookmark_items(),
+            OverlayKind::Recent => self.recent_items(),
+            OverlayKind::SearchResults => self.search_result_items(),
         }
+    }
+
+    pub(crate) fn overlay_item_emphasis(&self, index: usize) -> Option<Range<usize>> {
+        let overlay = self.overlay.as_ref()?;
+        if overlay.kind != OverlayKind::SearchResults {
+            return None;
+        }
+        let loaded = self.loaded.as_ref()?;
+        let session = self.search_session.as_ref()?;
+        let hit = session.previews.get(index)?;
+        let prefix = format!("{}/{}  ", hit.ordinal.saturating_add(1), session.total);
+        let context = search_context(loaded.document().text(), &hit.range, SEARCH_CONTEXT_WIDTH);
+        Some(
+            prefix.len().saturating_add(context.emphasis.start)
+                ..prefix.len().saturating_add(context.emphasis.end),
+        )
     }
 
     pub fn shutdown(&mut self) { self.save_progress(); }
 
     fn install_document(&mut self, loaded: LoadedDocument) {
-        let resume = self.store.resume_position(loaded.path(), loaded.fingerprint());
-        let position = resume.as_ref().map_or(0, |resume| resume.position);
+        let saved = self.store.load_book(loaded.path(), loaded.fingerprint());
+        let position = saved.position;
+        self.bookmarks = saved
+            .bookmarks
+            .into_iter()
+            .map(|mut bookmark| {
+                bookmark.position = floor_char_boundary(
+                    loaded.document().text(),
+                    bookmark.position.min(loaded.document().text().len()),
+                );
+                bookmark
+            })
+            .collect();
+        self.bookmarks.sort_by_key(|bookmark| (bookmark.position, bookmark.created_unix_ms));
+        self.bookmarks.dedup_by_key(|bookmark| bookmark.position);
+        self.state_warnings = saved.warnings;
         if let Err(error) = self.store.save_last_opened(loaded.path()) {
             self.message = Some(error.to_string());
-        } else if resume.is_some_and(|resume| resume.matched_by_fingerprint) {
-            self.message = Some("Restored progress after the file was moved".to_owned());
-        } else if loaded.warnings().is_empty() {
+        } else if saved.matched_by_fingerprint {
+            self.message = Some("Restored reading state after the file was moved".to_owned());
+        } else if loaded.warnings().is_empty() && self.state_warnings.is_empty() {
             self.message = None;
         } else {
+            let warning_count = loaded.warnings().len() + self.state_warnings.len();
             self.message = Some(format!(
                 "Opened with {} recovery warning{}; use :info for details",
-                loaded.warnings().len(),
-                if loaded.warnings().len() == 1 { "" } else { "s" }
+                warning_count,
+                if warning_count == 1 { "" } else { "s" }
             ));
         }
         let mut viewport = Viewport::new(loaded.document().text(), position);
@@ -323,7 +423,8 @@ impl App {
         self.loaded = Some(Arc::new(loaded));
         self.viewport = Some(viewport);
         self.current_match = None;
-        self.search_query = None;
+        self.search_session = None;
+        self.recent_books.clear();
         // Persist even a freshly opened book at position zero. Besides resume
         // state, this records the fingerprint used to recognise a later move.
         self.dirty_progress = true;
@@ -368,7 +469,11 @@ impl App {
                 let mode = std::mem::replace(&mut self.input_mode, InputMode::Normal);
                 match mode {
                     InputMode::Command => self.execute_command(&input),
-                    InputMode::Search => self.start_search(input, SearchDirection::Forward, None),
+                    InputMode::Search => self.start_search(
+                        SearchQuery::new(SearchKind::LooseLiteral, input),
+                        SearchDirection::Forward,
+                        None,
+                    ),
                     InputMode::Normal => {}
                 }
             }
@@ -405,6 +510,50 @@ impl App {
                 if let Some(offset) = offset {
                     self.goto_byte(offset);
                 }
+                return;
+            }
+            KeyCode::Enter if overlay.kind == OverlayKind::Bookmarks => {
+                let offset = self.bookmarks.get(overlay.selected).map(|bookmark| bookmark.position);
+                if let Some(offset) = offset {
+                    self.goto_byte(offset);
+                } else {
+                    self.overlay = Some(overlay);
+                }
+                return;
+            }
+            KeyCode::Enter if overlay.kind == OverlayKind::Recent => {
+                let path = self.recent_books.get(overlay.selected).map(|book| book.path.clone());
+                if let Some(path) = path {
+                    self.start_load(path);
+                } else {
+                    self.overlay = Some(overlay);
+                }
+                return;
+            }
+            KeyCode::Enter if overlay.kind == OverlayKind::SearchResults => {
+                let hit = self
+                    .search_session
+                    .as_ref()
+                    .and_then(|session| session.previews.get(overlay.selected))
+                    .cloned();
+                if let Some(hit) = hit {
+                    let ordinal = hit.ordinal;
+                    let total = self.search_session.as_ref().map_or(0, |session| session.total);
+                    if let Some(session) = self.search_session.as_mut() {
+                        session.current = Some(hit.clone());
+                    }
+                    self.goto_search_hit(hit.range);
+                    self.message = Some(format!("Match {}/{}", ordinal.saturating_add(1), total));
+                } else {
+                    self.overlay = Some(overlay);
+                }
+                return;
+            }
+            KeyCode::Char('x') if overlay.kind == OverlayKind::Bookmarks => {
+                self.delete_bookmark(overlay.selected);
+                overlay.selected = overlay.selected.min(self.bookmarks.len().saturating_sub(1));
+                self.overlay_max_position = self.bookmarks.len().saturating_sub(1);
+                self.overlay = Some(overlay);
                 return;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -460,6 +609,53 @@ impl App {
                 }
             }
             Ok(Command::Goto(percent)) => self.goto_percent(percent),
+            Ok(Command::Mark(label)) => self.add_bookmark(label),
+            Ok(Command::Marks) => {
+                if self.loaded.is_some() {
+                    let selected = self.current_bookmark_index();
+                    self.overlay = Some(OverlayState { kind: OverlayKind::Bookmarks, selected });
+                } else {
+                    self.message = Some("No document is open".to_owned());
+                }
+            }
+            Ok(Command::Recent) => {
+                let recent = self.store.recent_books(RECENT_BOOK_LIMIT);
+                let warning_count = recent.warnings.len();
+                self.recent_books = recent.books;
+                self.state_warnings.extend(recent.warnings);
+                if warning_count > 0 {
+                    self.message = Some(format!(
+                        "Skipped {warning_count} unreadable recent state record{}",
+                        if warning_count == 1 { "" } else { "s" }
+                    ));
+                }
+                self.overlay = Some(OverlayState { kind: OverlayKind::Recent, selected: 0 });
+            }
+            Ok(Command::Exact(pattern)) => self.start_search(
+                SearchQuery::new(SearchKind::ExactLiteral, pattern),
+                SearchDirection::Forward,
+                None,
+            ),
+            Ok(Command::Regex(pattern)) => self.start_search(
+                SearchQuery::new(SearchKind::Regex, pattern),
+                SearchDirection::Forward,
+                None,
+            ),
+            Ok(Command::Results) => {
+                if let Some(session) = self.search_session.as_ref()
+                    && !session.previews.is_empty()
+                {
+                    let selected = session.current.as_ref().and_then(|current| {
+                        session.previews.iter().position(|hit| hit.ordinal == current.ordinal)
+                    });
+                    self.overlay = Some(OverlayState {
+                        kind: OverlayKind::SearchResults,
+                        selected: selected.unwrap_or(0),
+                    });
+                } else {
+                    self.message = Some("No search results".to_owned());
+                }
+            }
             Ok(Command::Info) => {
                 if self.loaded.is_some() {
                     self.overlay = Some(OverlayState { kind: OverlayKind::Info, selected: 0 });
@@ -474,8 +670,13 @@ impl App {
         }
     }
 
-    fn start_search(&mut self, query: String, direction: SearchDirection, from: Option<usize>) {
-        if query.is_empty() {
+    fn start_search(
+        &mut self,
+        query: SearchQuery,
+        direction: SearchDirection,
+        from: Option<usize>,
+    ) {
+        if query.pattern.is_empty() {
             self.message = Some("Search text cannot be empty".to_owned());
             return;
         }
@@ -485,29 +686,121 @@ impl App {
         };
         let default_from = self.viewport.as_ref().map_or(0, Viewport::anchor);
         let from = from.unwrap_or(default_from);
-        self.search_query = Some(query.clone());
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let found = find_literal(loaded.document().text(), &query, from, direction);
-            let _ = sender.send(SearchTaskResult { generation, found });
+            let result =
+                analyze(loaded.document().text(), &query, from, direction, SEARCH_PREVIEW_LIMIT);
+            let _ = sender.send(SearchTaskResult {
+                generation,
+                payload: SearchTaskPayload::Analyze { query, result },
+            });
         });
         self.search_task = Some((generation, receiver));
         self.message = Some("Searching…".to_owned());
     }
 
     fn repeat_search(&mut self, direction: SearchDirection) {
-        let Some(query) = self.search_query.clone() else {
+        let Some(session) = self.search_session.as_ref() else {
             self.message = Some("No previous search".to_owned());
             return;
         };
+        let query = session.query.clone();
         let from = match (direction, self.current_match.as_ref()) {
             (SearchDirection::Forward, Some(found)) => found.end,
             (SearchDirection::Backward, Some(found)) => found.start,
             _ => self.viewport.as_ref().map_or(0, Viewport::anchor),
         };
-        self.start_search(query, direction, Some(from));
+        if self.current_match.is_none() || session.current.is_none() {
+            self.start_search(query, direction, Some(from));
+            return;
+        }
+        let Some(loaded) = self.loaded.clone() else {
+            return;
+        };
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = find_next(loaded.document().text(), &query, from, direction);
+            let _ = sender.send(SearchTaskResult {
+                generation,
+                payload: SearchTaskPayload::Step { direction, result },
+            });
+        });
+        self.search_task = Some((generation, receiver));
+        self.message = Some("Searching…".to_owned());
+    }
+
+    fn finish_search_analysis(
+        &mut self,
+        query: SearchQuery,
+        result: Result<SearchAnalysis, SearchError>,
+    ) {
+        match result {
+            Ok(analysis) => {
+                let current = analysis.current.clone();
+                self.search_session = Some(SearchSession {
+                    query,
+                    current: analysis.current,
+                    total: analysis.total,
+                    previews: analysis.previews,
+                });
+                if let Some(hit) = current {
+                    self.goto_search_hit(hit.range);
+                    self.message =
+                        Some(format!("Match {}/{}", hit.ordinal.saturating_add(1), analysis.total));
+                } else {
+                    self.current_match = None;
+                    self.message = Some("No matches".to_owned());
+                }
+            }
+            Err(error) => self.message = Some(error.to_string()),
+        }
+    }
+
+    fn finish_search_step(
+        &mut self,
+        direction: SearchDirection,
+        result: Result<Option<Range<usize>>, SearchError>,
+    ) {
+        match result {
+            Ok(Some(range)) => {
+                let Some(session) = self.search_session.as_mut() else {
+                    return;
+                };
+                let ordinal = match (direction, session.current.as_ref(), session.total) {
+                    (_, _, 0) => 0,
+                    (SearchDirection::Forward, Some(current), total) => {
+                        current.ordinal.saturating_add(1) % total
+                    }
+                    (SearchDirection::Backward, Some(current), total) => {
+                        current.ordinal.checked_sub(1).unwrap_or(total.saturating_sub(1))
+                    }
+                    _ => 0,
+                };
+                let hit = SearchHit { range: range.clone(), ordinal };
+                session.current = Some(hit.clone());
+                insert_search_preview(&mut session.previews, hit, SEARCH_PREVIEW_LIMIT);
+                let total = session.total;
+                self.goto_search_hit(range);
+                self.message = Some(format!("Match {}/{}", ordinal.saturating_add(1), total));
+            }
+            Ok(None) => {
+                self.current_match = None;
+                self.message = Some("No matches".to_owned());
+            }
+            Err(error) => self.message = Some(error.to_string()),
+        }
+    }
+
+    fn goto_search_hit(&mut self, range: Range<usize>) {
+        if let (Some(loaded), Some(viewport)) = (self.loaded.as_ref(), self.viewport.as_mut()) {
+            viewport.goto_byte(loaded.document().text(), range.start);
+            self.current_match = Some(range);
+            self.mark_moved();
+        }
     }
 
     fn scroll(&mut self, delta: isize) {
@@ -589,6 +882,132 @@ impl App {
         loaded.document().toc().partition_point(|entry| entry.offset() <= anchor).saturating_sub(1)
     }
 
+    fn add_bookmark(&mut self, label: Option<String>) {
+        let Some(loaded) = self.loaded.as_ref() else {
+            self.message = Some("No document is open".to_owned());
+            return;
+        };
+        let label = label.map(|label| label.trim().to_owned()).filter(|label| !label.is_empty());
+        if label.as_ref().is_some_and(|label| label.chars().count() > BOOKMARK_LABEL_LIMIT) {
+            self.message =
+                Some(format!("Bookmark labels cannot exceed {BOOKMARK_LABEL_LIMIT} characters"));
+            return;
+        }
+        let position = self.viewport.as_ref().map_or(0, Viewport::anchor);
+        let previous = self.bookmarks.clone();
+        if let Some(bookmark) =
+            self.bookmarks.iter_mut().find(|bookmark| bookmark.position == position)
+        {
+            bookmark.label = label;
+        } else {
+            self.bookmarks.push(Bookmark { position, label, created_unix_ms: now_unix_ms() });
+            self.bookmarks.sort_by_key(|bookmark| bookmark.position);
+        }
+        match self.store.save_bookmarks(loaded.path(), loaded.fingerprint(), &self.bookmarks) {
+            Ok(()) => self.message = Some("Bookmark saved".to_owned()),
+            Err(error) => {
+                self.bookmarks = previous;
+                self.message = Some(error.to_string());
+            }
+        }
+    }
+
+    fn delete_bookmark(&mut self, index: usize) {
+        if index >= self.bookmarks.len() {
+            return;
+        }
+        let Some(loaded) = self.loaded.as_ref() else {
+            return;
+        };
+        let previous = self.bookmarks.clone();
+        self.bookmarks.remove(index);
+        match self.store.save_bookmarks(loaded.path(), loaded.fingerprint(), &self.bookmarks) {
+            Ok(()) => self.message = Some("Bookmark deleted".to_owned()),
+            Err(error) => {
+                self.bookmarks = previous;
+                self.message = Some(error.to_string());
+            }
+        }
+    }
+
+    fn current_bookmark_index(&self) -> usize {
+        let anchor = self.viewport.as_ref().map_or(0, Viewport::anchor);
+        self.bookmarks.partition_point(|bookmark| bookmark.position <= anchor).saturating_sub(1)
+    }
+
+    fn bookmark_items(&self) -> Vec<String> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return vec!["No document is open".to_owned()];
+        };
+        if self.bookmarks.is_empty() {
+            return vec!["No bookmarks yet; use :mark [label] to add one".to_owned()];
+        }
+        let text = loaded.document().text();
+        let total_chars = loaded.document().total_chars().max(1);
+        let mut current_byte = 0;
+        let mut current_chars = 0;
+        self.bookmarks
+            .iter()
+            .map(|bookmark| {
+                let position = floor_char_boundary(text, bookmark.position.min(text.len()));
+                current_chars += text[current_byte..position].chars().count();
+                current_byte = position;
+                let percent = current_chars as f64 * 100.0 / total_chars as f64;
+                let label = bookmark
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| bookmark_fallback_label(loaded, position));
+                format!("{label} · {percent:.1}%")
+            })
+            .collect()
+    }
+
+    fn recent_items(&self) -> Vec<String> {
+        if self.recent_books.is_empty() {
+            return vec!["No readable recent books".to_owned()];
+        }
+        let now = now_unix_ms();
+        self.recent_books
+            .iter()
+            .map(|book| {
+                let name = book.path.file_name().map_or_else(
+                    || book.path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                let parent = book.path.parent().map_or_else(String::new, compact_path);
+                let age = relative_age(now.saturating_sub(book.updated_unix_ms));
+                if parent.is_empty() {
+                    format!("{name} · {age}")
+                } else {
+                    format!("{name} · {parent} · {age}")
+                }
+            })
+            .collect()
+    }
+
+    fn search_result_items(&self) -> Vec<String> {
+        let (Some(loaded), Some(session)) = (self.loaded.as_ref(), self.search_session.as_ref())
+        else {
+            return vec!["No search results".to_owned()];
+        };
+        if session.previews.is_empty() {
+            return vec!["No search results".to_owned()];
+        }
+        session
+            .previews
+            .iter()
+            .map(|hit| {
+                format!(
+                    "{}/{}  {}",
+                    hit.ordinal.saturating_add(1),
+                    session.total,
+                    search_context(loaded.document().text(), &hit.range, SEARCH_CONTEXT_WIDTH,)
+                        .text
+                )
+            })
+            .collect()
+    }
+
     fn info_lines(&self) -> Vec<String> {
         let Some(loaded) = self.loaded.as_ref() else {
             return Vec::new();
@@ -606,6 +1025,9 @@ impl App {
         ];
         for warning in loaded.warnings() {
             lines.push(format!("Warning [{}]: {}", warning.code(), warning.message()));
+        }
+        for warning in &self.state_warnings {
+            lines.push(format!("State warning [{}]: {}", warning.code(), warning.message()));
         }
         lines
     }
@@ -662,6 +1084,12 @@ enum Command {
     Quit,
     Toc,
     Goto(f64),
+    Mark(Option<String>),
+    Marks,
+    Recent,
+    Exact(String),
+    Regex(String),
+    Results,
     Info,
     Help,
 }
@@ -675,6 +1103,14 @@ fn parse_command(raw: &str) -> Result<Command, String> {
         "e" | "open" => Err("Usage: :e <path>".to_owned()),
         "q" | "quit" => Ok(Command::Quit),
         "toc" => Ok(Command::Toc),
+        "mark" => Ok(Command::Mark((!arguments.is_empty()).then(|| arguments.to_owned()))),
+        "marks" | "bookmarks" => Ok(Command::Marks),
+        "recent" => Ok(Command::Recent),
+        "exact" if !arguments.is_empty() => Ok(Command::Exact(arguments.to_owned())),
+        "exact" => Err("Usage: :exact <text>".to_owned()),
+        "re" | "regex" if !arguments.is_empty() => Ok(Command::Regex(arguments.to_owned())),
+        "re" | "regex" => Err("Usage: :re <pattern>".to_owned()),
+        "results" => Ok(Command::Results),
         "info" => Ok(Command::Info),
         "help" | "h" => Ok(Command::Help),
         "goto" => {
@@ -701,6 +1137,110 @@ fn unquote(value: &str) -> &str {
     }
 }
 
+fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn bookmark_fallback_label(loaded: &LoadedDocument, position: usize) -> String {
+    if let Some(entry) =
+        loaded.document().toc().iter().rev().find(|entry| entry.offset() <= position)
+    {
+        return entry.label().to_owned();
+    }
+    let text = loaded.document().text();
+    let start = text[..position].rfind('\n').map_or(0, |offset| offset + 1);
+    let end = text[position..].find('\n').map_or(text.len(), |offset| position + offset);
+    let line = text[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return "Untitled bookmark".to_owned();
+    }
+    let mut characters = line.chars();
+    let preview = characters.by_ref().take(40).collect::<String>();
+    if characters.next().is_some() { format!("{preview}…") } else { preview }
+}
+
+fn compact_path(path: &Path) -> String {
+    if let Some(home) = UserDirs::new().map(|directories| directories.home_dir().to_path_buf())
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        return if relative.as_os_str().is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~/{}", relative.display())
+        };
+    }
+    path.display().to_string()
+}
+
+fn relative_age(milliseconds: u128) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        "just now".to_owned()
+    } else if seconds < 60 * 60 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h ago", seconds / (60 * 60))
+    } else {
+        format!("{}d ago", seconds / (24 * 60 * 60))
+    }
+}
+
+fn insert_search_preview(previews: &mut Vec<SearchHit>, hit: SearchHit, limit: usize) {
+    if limit == 0 {
+        previews.clear();
+        return;
+    }
+    let current = hit.ordinal;
+    if let Some(existing) = previews.iter_mut().find(|preview| preview.ordinal == current) {
+        *existing = hit;
+    } else {
+        previews.push(hit);
+        previews.sort_by_key(|preview| preview.ordinal);
+    }
+    while previews.len() > limit {
+        let first_distance = current.saturating_sub(previews[0].ordinal);
+        let last_distance = previews.last().unwrap().ordinal.saturating_sub(current);
+        if first_distance > last_distance {
+            previews.remove(0);
+        } else {
+            previews.pop();
+        }
+    }
+}
+
+fn search_context(text: &str, range: &Range<usize>, width: usize) -> SearchContext {
+    let start = floor_char_boundary(text, range.start.min(text.len()));
+    let raw_end = floor_char_boundary(text, range.end.min(text.len()));
+    let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let line_end = text[start..].find('\n').map_or(text.len(), |offset| start + offset);
+    let end = raw_end.max(start).min(line_end);
+    let side = width.saturating_sub(8) / 2;
+    let before_full = &text[line_start..start];
+    let before_chars = before_full.chars().count();
+    let mut before = before_full.chars().rev().take(side).collect::<Vec<_>>();
+    before.reverse();
+    let before = before.into_iter().collect::<String>();
+    let matched = text[start..end].chars().take(width / 2).collect::<String>();
+    let after_full = &text[end..line_end];
+    let after = after_full.chars().take(side).collect::<String>();
+    let mut text = String::new();
+    if before_chars > side {
+        text.push('…');
+    }
+    text.push_str(&before);
+    let emphasis_start = text.len();
+    text.push_str(&matched);
+    let emphasis_end = text.len();
+    text.push_str(&after);
+    if after_full.chars().count() > side {
+        text.push('…');
+    }
+    SearchContext { text, emphasis: emphasis_start..emphasis_end }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -720,6 +1260,15 @@ mod tests {
         (directory, app)
     }
 
+    fn wait_for_search(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.search_task.is_some() && Instant::now() < deadline {
+            app.poll_tasks();
+            thread::yield_now();
+        }
+        assert!(app.search_task.is_none(), "search did not finish before the test deadline");
+    }
+
     #[test]
     fn parses_open_path_without_splitting_spaces() {
         assert_eq!(
@@ -732,6 +1281,26 @@ mod tests {
     fn parses_and_validates_percentage() {
         assert_eq!(parse_command("goto 38%").unwrap(), Command::Goto(38.0));
         assert!(parse_command("goto 101%").is_err());
+    }
+
+    #[test]
+    fn parses_v2_commands_without_splitting_arguments() {
+        assert_eq!(
+            parse_command("mark 重要 转折").unwrap(),
+            Command::Mark(Some("重要 转折".to_owned()))
+        );
+        assert_eq!(parse_command("mark").unwrap(), Command::Mark(None));
+        assert_eq!(
+            parse_command("exact 第一章 风起").unwrap(),
+            Command::Exact("第一章 风起".to_owned())
+        );
+        assert_eq!(
+            parse_command("re 第[一二]章").unwrap(),
+            Command::Regex("第[一二]章".to_owned())
+        );
+        assert_eq!(parse_command("marks").unwrap(), Command::Marks);
+        assert_eq!(parse_command("recent").unwrap(), Command::Recent);
+        assert_eq!(parse_command("results").unwrap(), Command::Results);
     }
 
     #[test]
@@ -863,6 +1432,150 @@ mod tests {
         assert!(help.contains("→/←"));
         assert!(help.contains("PgDn/PgUp"));
         assert!(help.contains("Enter/Esc"));
+        assert!(help.contains(":mark/:marks"));
+        assert!(help.contains(":recent"));
+        assert!(help.contains(":exact/:re"));
+    }
+
+    #[test]
+    fn bookmarks_are_persisted_updated_browsed_and_deleted() {
+        let text = "第一章 风起\n正文。\n第二章 云涌\n正文。";
+        let (_directory, mut app) = app_with_text(text);
+        let path = app.document().unwrap().path().to_path_buf();
+        let fingerprint = app.document().unwrap().fingerprint().to_owned();
+
+        app.execute_command("mark 开始");
+        assert_eq!(app.bookmarks.len(), 1);
+        assert_eq!(app.bookmarks[0].label.as_deref(), Some("开始"));
+        app.execute_command("mark 新标签");
+        assert_eq!(app.bookmarks.len(), 1);
+        assert_eq!(app.bookmarks[0].label.as_deref(), Some("新标签"));
+
+        let second = text.find("第二章").unwrap();
+        app.goto_byte(second);
+        app.execute_command("mark");
+        assert_eq!(app.bookmarks.len(), 2);
+        assert_eq!(app.store.load_book(&path, &fingerprint).bookmarks.len(), 2);
+
+        app.execute_command("marks");
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::Bookmarks);
+        assert_eq!(app.overlay_title().as_deref(), Some("Bookmarks · 2/2"));
+        assert!(app.overlay_items()[1].contains("第二章 云涌"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.bookmarks.len(), 1);
+        assert_eq!(app.store.load_book(&path, &fingerprint).bookmarks.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.overlay().is_none());
+        assert_eq!(app.viewport.as_ref().unwrap().anchor(), 0);
+    }
+
+    #[test]
+    fn empty_bookmarks_overlay_stays_open_on_enter() {
+        let (_directory, mut app) = app_with_text("正文。");
+
+        app.execute_command("marks");
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::Bookmarks);
+        assert_eq!(app.overlay_items(), ["No bookmarks yet; use :mark [label] to add one"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::Bookmarks);
+    }
+
+    #[test]
+    fn recent_overlay_opens_the_latest_existing_book() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        store.save_progress(&first, "first", 0).unwrap();
+        thread::sleep(Duration::from_millis(2));
+        store.save_progress(&second, "second", 0).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+
+        app.execute_command("recent");
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::Recent);
+        assert!(app.overlay_items()[0].starts_with("second.txt"));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.document().is_none() && Instant::now() < deadline {
+            app.poll_tasks();
+            thread::yield_now();
+        }
+        assert_eq!(app.document().unwrap().path(), fs::canonicalize(second).unwrap());
+    }
+
+    #[test]
+    fn empty_recent_overlay_stays_open_on_enter() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+
+        app.execute_command("recent");
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::Recent);
+        assert_eq!(app.overlay_items(), ["No readable recent books"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::Recent);
+    }
+
+    #[test]
+    fn loose_search_builds_a_session_and_results_overlay() {
+        let text = "第一章：风起\n正文。\n第一章 风起\n结尾。";
+        let (_directory, mut app) = app_with_text(text);
+
+        app.start_search(
+            SearchQuery::new(SearchKind::LooseLiteral, "第一章风起"),
+            SearchDirection::Forward,
+            Some(0),
+        );
+        wait_for_search(&mut app);
+
+        let session = app.search_session.as_ref().unwrap();
+        assert_eq!(session.total, 2);
+        assert_eq!(session.current.as_ref().unwrap().ordinal, 0);
+        assert_eq!(&text[app.current_match().unwrap()], "第一章：风起");
+        assert_eq!(app.message.as_deref(), Some("Match 1/2"));
+
+        app.execute_command("results");
+        assert_eq!(app.overlay().unwrap().kind, OverlayKind::SearchResults);
+        let items = app.overlay_items();
+        assert_eq!(items.len(), 2);
+        let emphasis = app.overlay_item_emphasis(0).unwrap();
+        assert_eq!(&items[0][emphasis], "第一章：风起");
+        assert!(!items[0].contains('‹') && !items[0].contains('›'));
+        app.overlay.as_mut().unwrap().selected = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(&text[app.current_match().unwrap()], "第一章 风起");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        wait_for_search(&mut app);
+        assert_eq!(&text[app.current_match().unwrap()], "第一章：风起");
+        assert_eq!(app.message.as_deref(), Some("Match 1/2"));
+    }
+
+    #[test]
+    fn exact_and_regex_commands_report_results_and_errors() {
+        let text = "CHAPTER 1\nchapter 2";
+        let (_directory, mut app) = app_with_text(text);
+
+        app.execute_command("exact chapter 2");
+        wait_for_search(&mut app);
+        assert_eq!(&text[app.current_match().unwrap()], "chapter 2");
+        assert_eq!(app.search_session.as_ref().unwrap().total, 1);
+
+        app.execute_command("re (?i)chapter [12]");
+        wait_for_search(&mut app);
+        assert_eq!(app.search_session.as_ref().unwrap().total, 2);
+
+        app.execute_command("re [");
+        wait_for_search(&mut app);
+        assert!(app.message.as_deref().unwrap().starts_with("invalid regular expression"));
     }
 
     #[test]
@@ -883,6 +1596,6 @@ mod tests {
         assert_eq!(app.document().unwrap().document().text(), "hello\nworld");
         let fingerprint = app.document().unwrap().fingerprint().to_owned();
         app.shutdown();
-        assert_eq!(store.resume_position(&book, &fingerprint).unwrap().position, 0);
+        assert_eq!(store.load_book(&book, &fingerprint).position, 0);
     }
 }
