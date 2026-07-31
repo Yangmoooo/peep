@@ -1,14 +1,27 @@
 # Changelog
 
 这里记录 Peep 面向使用者的重要变更。格式参考
-[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循
 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-31
+
+### Added
+
+- **书签**：使用 `:mark` 保存当前位置，通过 `:marks` 浏览、跳转和删除；文件仅移动或改名时，书签会随阅读进度一起恢复。
+- **最近阅读**：使用 `:recent` 浏览并重新打开最近读过的本地文件。
+- **更灵活的搜索**：`/text` 现在能够容忍内部空白、标点、英文大小写和常见全半角差异，同时不会跨行或跳过正文；另提供 `:exact` 精确搜索和 `:re` 正则搜索。
+- **搜索结果浏览**：搜索会显示当前命中与总数，`n/N` 可继续导航，`:results` 可查看带上下文的结果列表。
+
+### Changed
+
+- **状态兼容与保护**：继续读取 v0.1 阅读进度，将书签独立保存，并避免覆盖损坏或来自更新版本的书签状态。
+
 ## [0.1.0] - 2026-07-30
 
-### 新增
+### Added
 
 - **EPUB 与 TXT 阅读**：支持 EPUB、UTF-8、UTF-8 BOM 和 GB18030 文本，正文会按终端宽度自动折行并连续滚动。
 - **快捷导航**：支持按行、半页、整页、章节和文档首尾移动，方向键、PageUp/PageDown 与 Vim 风格按键均可使用。
@@ -19,5 +32,6 @@
 - **TXT 章节识别**：自动识别常见的章、回、卷、部、集及复合卷章结构，同时尽量避免把正文中的编号误判为章节。
 - **跨平台支持**：可运行于 macOS、Linux 和 Windows Terminal。
 
-[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Yangmoooo/peep/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Yangmoooo/peep/releases/tag/v0.1.0
