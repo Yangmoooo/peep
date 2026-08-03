@@ -215,8 +215,10 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
         )
         .highlight_symbol("› ");
 
-    let mut state = ListState::default().with_selected(Some(selected));
+    let mut state =
+        ListState::default().with_selected(Some(selected)).with_offset(app.overlay_list_offset());
     frame.render_stateful_widget(list, area, &mut state);
+    app.set_overlay_list_offset(state.offset());
 }
 
 fn styled_line<'a>(
@@ -406,10 +408,15 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+    use std::{fs, thread};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::app::{OverlayKind, OverlayState};
     use crate::state::StateStore;
 
     #[test]
@@ -436,6 +443,48 @@ mod tests {
             terminal.backend().buffer().cell(Position::new(1, 6)).unwrap().bg,
             ui_palette().surface
         );
+    }
+
+    #[test]
+    fn toc_cursor_moves_up_before_the_list_viewport_scrolls() {
+        let directory = tempfile::tempdir().unwrap();
+        let book = directory.path().join("book.txt");
+        let text = (1..=20)
+            .map(|number| format!("第{number}章 标题{number}\n正文。\n"))
+            .collect::<String>();
+        fs::write(&book, text).unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+        app.start_load(book);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.document().is_none() && Instant::now() < deadline {
+            app.poll_tasks();
+            thread::yield_now();
+        }
+        assert_eq!(app.document().unwrap().document().toc().len(), 20);
+        app.overlay = Some(OverlayState { kind: OverlayKind::Toc, selected: 19 });
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bottom_row = selected_overlay_row(&terminal, 8);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let moved_row = selected_overlay_row(&terminal, 8);
+
+        assert_eq!(moved_row + 1, bottom_row);
+    }
+
+    fn selected_overlay_row(terminal: &Terminal<TestBackend>, body_height: u16) -> u16 {
+        let buffer = terminal.backend().buffer();
+        (0..body_height)
+            .find(|&y| {
+                (0..buffer.area.width).any(|x| {
+                    buffer.cell(Position::new(x, y)).is_some_and(|cell| cell.symbol() == "›")
+                })
+            })
+            .expect("selected overlay row")
     }
 
     #[test]

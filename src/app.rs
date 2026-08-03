@@ -74,6 +74,7 @@ pub struct App {
     viewport_height: usize,
     overlay_max_position: usize,
     overlay_page_rows: usize,
+    overlay_list_offset: usize,
     dirty_progress: bool,
     last_move: Instant,
     should_quit: bool,
@@ -132,6 +133,7 @@ impl App {
             viewport_height: 1,
             overlay_max_position: 0,
             overlay_page_rows: 1,
+            overlay_list_offset: 0,
             dirty_progress: false,
             last_move: Instant::now(),
             should_quit: false,
@@ -150,8 +152,15 @@ impl App {
 
     pub fn overlay(&self) -> Option<&OverlayState> { self.overlay.as_ref() }
 
+    pub(crate) fn overlay_list_offset(&self) -> usize { self.overlay_list_offset }
+
+    pub(crate) fn set_overlay_list_offset(&mut self, offset: usize) {
+        self.overlay_list_offset = offset;
+    }
+
     pub fn set_overlay_layout(&mut self, content_rows: usize, viewport_rows: usize) {
         self.overlay_page_rows = viewport_rows.max(1);
+        let is_list = self.overlay.as_ref().is_some_and(|overlay| overlay.kind.is_list());
         self.overlay_max_position = self.overlay.as_ref().map_or(0, |overlay| {
             if overlay.kind.is_list() {
                 content_rows.saturating_sub(1)
@@ -162,6 +171,11 @@ impl App {
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.selected = overlay.selected.min(self.overlay_max_position);
         }
+        self.overlay_list_offset = if is_list {
+            self.overlay_list_offset.min(content_rows.saturating_sub(viewport_rows))
+        } else {
+            0
+        };
     }
 
     pub fn cwd(&self) -> &Path { &self.cwd }
@@ -594,16 +608,18 @@ impl App {
         self.message = None;
     }
 
+    fn show_overlay(&mut self, kind: OverlayKind, selected: usize) {
+        self.overlay = Some(OverlayState { kind, selected });
+        self.overlay_list_offset = 0;
+    }
+
     fn execute_command(&mut self, raw: &str) {
         match parse_command(raw) {
             Ok(Command::Open(path)) => self.start_load(self.resolve_path(&path)),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(Command::Toc) => {
                 if self.loaded.as_ref().is_some_and(|loaded| !loaded.document().toc().is_empty()) {
-                    self.overlay = Some(OverlayState {
-                        kind: OverlayKind::Toc,
-                        selected: self.current_toc_index(),
-                    });
+                    self.show_overlay(OverlayKind::Toc, self.current_toc_index());
                 } else {
                     self.message = Some("This document has no table of contents".to_owned());
                 }
@@ -613,7 +629,7 @@ impl App {
             Ok(Command::Marks) => {
                 if self.loaded.is_some() {
                     let selected = self.current_bookmark_index();
-                    self.overlay = Some(OverlayState { kind: OverlayKind::Bookmarks, selected });
+                    self.show_overlay(OverlayKind::Bookmarks, selected);
                 } else {
                     self.message = Some("No document is open".to_owned());
                 }
@@ -629,7 +645,7 @@ impl App {
                         if warning_count == 1 { "" } else { "s" }
                     ));
                 }
-                self.overlay = Some(OverlayState { kind: OverlayKind::Recent, selected: 0 });
+                self.show_overlay(OverlayKind::Recent, 0);
             }
             Ok(Command::Exact(pattern)) => self.start_search(
                 SearchQuery::new(SearchKind::ExactLiteral, pattern),
@@ -648,23 +664,20 @@ impl App {
                     let selected = session.current.as_ref().and_then(|current| {
                         session.previews.iter().position(|hit| hit.ordinal == current.ordinal)
                     });
-                    self.overlay = Some(OverlayState {
-                        kind: OverlayKind::SearchResults,
-                        selected: selected.unwrap_or(0),
-                    });
+                    self.show_overlay(OverlayKind::SearchResults, selected.unwrap_or(0));
                 } else {
                     self.message = Some("No search results".to_owned());
                 }
             }
             Ok(Command::Info) => {
                 if self.loaded.is_some() {
-                    self.overlay = Some(OverlayState { kind: OverlayKind::Info, selected: 0 });
+                    self.show_overlay(OverlayKind::Info, 0);
                 } else {
                     self.message = Some("No document is open".to_owned());
                 }
             }
             Ok(Command::Help) => {
-                self.overlay = Some(OverlayState { kind: OverlayKind::Help, selected: 0 });
+                self.show_overlay(OverlayKind::Help, 0);
             }
             Err(error) => self.message = Some(error),
         }
