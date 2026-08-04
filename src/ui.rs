@@ -4,7 +4,7 @@ use directories::UserDirs;
 use ratatui::Frame;
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
@@ -16,27 +16,18 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, InputMode};
 use crate::document::{CanonicalDocument, TextStyleKind};
 use crate::terminal_palette;
-use crate::terminal_palette::DefaultColors;
+use crate::theme::Theme;
 use crate::viewport::VisualLine;
 
 const MAX_BODY_WIDTH: u16 = 100;
 
-#[derive(Clone, Copy)]
-struct UiPalette {
-    surface: Color,
-    text: Color,
-    muted: Color,
-    accent: Color,
-    has_surface: bool,
-}
-
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    let theme = Theme::resolve(app.theme_choice(), terminal_palette::default_colors());
+    frame.render_widget(Block::default().style(theme.body), area);
     if area.width < 20 || area.height < 6 {
         frame.render_widget(
-            Paragraph::new("Terminal too small")
-                .style(Style::default().fg(Color::DarkGray))
-                .centered(),
+            Paragraph::new("Terminal too small").style(theme.muted).centered(),
             area,
         );
         return;
@@ -47,15 +38,15 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)])
         .split(area);
 
-    render_body(frame, app, rows[0]);
-    render_composer(frame, app, rows[1]);
-    render_status(frame, app, rows[2]);
+    render_body(frame, app, rows[0], theme);
+    render_composer(frame, app, rows[1], theme);
+    render_status(frame, app, rows[2], theme);
     if app.overlay().is_some() {
-        render_overlay(frame, app, rows[0]);
+        render_overlay(frame, app, rows[0], theme);
     }
 }
 
-fn render_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn render_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let width = area.width.saturating_sub(4).clamp(1, MAX_BODY_WIDTH);
     let body = Rect::new(
         area.x.saturating_add(2),
@@ -67,39 +58,38 @@ fn render_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let lines = if let Some(loaded) = app.document() {
         visual_lines
             .iter()
-            .map(|line| styled_line(loaded.document(), line, app.current_match()))
+            .map(|line| styled_line(loaded.document(), line, app.current_match(), theme))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
-    frame.render_widget(Paragraph::new(Text::from(lines)), body);
+    frame.render_widget(Paragraph::new(Text::from(lines)).style(theme.body), body);
 }
 
-fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let area = area.inner(Margin { horizontal: 1, vertical: 0 });
-    let palette = ui_palette();
-    let surface_style = Style::default().fg(palette.text).bg(palette.surface);
+    let surface_style = theme.surface;
     let text = app.composer_text();
     let prompt_style = match app.input_mode() {
         InputMode::Command | InputMode::Search => {
-            surface_style.fg(palette.accent).add_modifier(Modifier::BOLD)
+            surface_style.patch(theme.accent).add_modifier(Modifier::BOLD)
         }
-        InputMode::Normal => surface_style.fg(palette.muted),
+        InputMode::Normal => surface_style.patch(theme.muted),
     };
     let text_style = match app.input_mode() {
         InputMode::Command | InputMode::Search => surface_style,
-        InputMode::Normal if app.loading_path.is_some() => surface_style.fg(palette.accent),
+        InputMode::Normal if app.loading_path.is_some() => surface_style.patch(theme.accent),
         InputMode::Normal if app.message.is_some() => surface_style,
-        InputMode::Normal => surface_style.fg(palette.muted),
+        InputMode::Normal => surface_style.patch(theme.muted),
     };
     let line =
         Line::from(vec![Span::styled("› ", prompt_style), Span::styled(text.as_str(), text_style)]);
-    let block = if palette.has_surface {
+    let block = if theme.surface_visible {
         Block::default().padding(ratatui::widgets::Padding::new(2, 1, 1, 1))
     } else {
         Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(palette.muted))
+            .border_style(theme.border)
             .padding(ratatui::widgets::Padding::new(2, 1, 0, 1))
     };
     let surface = Paragraph::new(line).style(surface_style).block(block);
@@ -113,15 +103,15 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let area = area.inner(Margin { horizontal: 3, vertical: 0 });
     let left = compact_home(app.cwd());
     let right = format!("{:.0}%", app.progress_percent());
     let line = fit_status(&left, &right, area.width as usize);
-    frame.render_widget(Paragraph::new(line).style(Style::default().fg(ui_palette().muted)), area);
+    frame.render_widget(Paragraph::new(line).style(theme.body.patch(theme.muted)), area);
 }
 
-fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
+fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect, theme: Theme) {
     let Some(kind) = app.overlay().map(|overlay| overlay.kind) else {
         return;
     };
@@ -130,8 +120,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
     let width = body.width.saturating_sub(4).clamp(10, 80);
     let height = desired_height.min(body.height.saturating_sub(1).max(3));
     let area = centered_rect(width, height, body);
-    let palette = ui_palette();
-    let surface_style = Style::default().fg(palette.text).bg(palette.surface);
+    let surface_style = theme.surface;
     frame.render_widget(Clear, area);
 
     let wrapped_items = (!kind.is_list())
@@ -143,10 +132,10 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
     let overlay_block = || {
         Block::default()
             .title(title.as_str())
-            .title_style(Style::default().fg(palette.accent))
+            .title_style(surface_style.patch(theme.accent))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(palette.muted))
+            .border_style(theme.border)
             .style(surface_style)
     };
 
@@ -167,8 +156,8 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
                 .end_symbol(None)
                 .track_symbol(Some("│"))
                 .thumb_symbol("┃")
-                .track_style(Style::default().fg(palette.muted).bg(palette.surface))
-                .thumb_style(Style::default().fg(palette.accent).bg(palette.surface));
+                .track_style(theme.border)
+                .thumb_style(surface_style.patch(theme.accent));
             frame.render_stateful_widget(
                 scrollbar,
                 area.inner(Margin { horizontal: 0, vertical: 1 }),
@@ -197,13 +186,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
             let after = item[range.end..].to_owned();
             ListItem::new(Line::from(vec![
                 Span::raw(before),
-                Span::styled(
-                    matched,
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(matched, surface_style.patch(theme.matched)),
                 Span::raw(after),
             ]))
         })
@@ -211,9 +194,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
     let list = List::new(list_items)
         .style(surface_style)
         .block(overlay_block())
-        .highlight_style(
-            Style::default().fg(Color::Black).bg(palette.accent).add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(theme.selected)
         .highlight_symbol("› ");
 
     let mut state =
@@ -251,6 +232,7 @@ fn styled_line<'a>(
     document: &'a CanonicalDocument,
     visual: &VisualLine,
     current_match: Option<Range<usize>>,
+    theme: Theme,
 ) -> Line<'a> {
     let range = visual.range();
     if range.is_empty() {
@@ -278,16 +260,14 @@ fn styled_line<'a>(
             let start = window[0];
             let end = window[1];
             (start < end).then(|| {
-                let mut style = Style::default();
+                let mut style = theme.body;
                 for text_style in document.styles() {
                     let style_range = text_style.range();
                     if start >= style_range.start && start < style_range.end {
                         style = match text_style.kind() {
                             TextStyleKind::Emphasis => style.add_modifier(Modifier::ITALIC),
                             TextStyleKind::Strong => style.add_modifier(Modifier::BOLD),
-                            TextStyleKind::Heading(_) => {
-                                style.fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                            }
+                            TextStyleKind::Heading(_) => style.patch(theme.heading),
                         };
                     }
                 }
@@ -295,7 +275,7 @@ fn styled_line<'a>(
                     .as_ref()
                     .is_some_and(|found| start >= found.start && start < found.end)
                 {
-                    style = style.fg(Color::Black).bg(Color::Yellow);
+                    style = style.patch(theme.matched);
                 }
                 Span::styled(&document.text()[start..end], style)
             })
@@ -307,45 +287,6 @@ fn styled_line<'a>(
 fn intersects(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
-
-fn ui_palette() -> UiPalette { palette_for_default_colors(terminal_palette::default_colors()) }
-
-fn palette_for_default_colors(colors: Option<DefaultColors>) -> UiPalette {
-    let Some(colors) = colors else {
-        return UiPalette {
-            surface: Color::Reset,
-            text: Color::Reset,
-            muted: Color::DarkGray,
-            accent: Color::Cyan,
-            has_surface: false,
-        };
-    };
-    let light = is_light(colors.background);
-    let surface = if light {
-        blend((0, 0, 0), colors.background, 0.04)
-    } else {
-        blend((255, 255, 255), colors.background, 0.12)
-    };
-    UiPalette {
-        surface: rgb(surface),
-        text: rgb(colors.foreground),
-        muted: rgb(blend(colors.foreground, colors.background, 0.55)),
-        accent: if light { Color::Rgb(0, 95, 135) } else { Color::Cyan },
-        has_surface: true,
-    }
-}
-
-fn is_light((red, green, blue): (u8, u8, u8)) -> bool {
-    299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue) > 128_000
-}
-
-fn blend(top: (u8, u8, u8), bottom: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
-    let channel =
-        |top: u8, bottom: u8| (f32::from(top) * alpha + f32::from(bottom) * (1.0 - alpha)) as u8;
-    (channel(top.0, bottom.0), channel(top.1, bottom.1), channel(top.2, bottom.2))
-}
-
-fn rgb((red, green, blue): (u8, u8, u8)) -> Color { Color::Rgb(red, green, blue) }
 
 fn wrap_overlay_items(items: &[String], width: usize) -> Vec<String> {
     let width = width.max(1);
@@ -465,10 +406,6 @@ mod tests {
         assert!(rendered.contains("› Ask anything…"));
         assert!(!rendered.contains('╭'));
         assert!(rendered.contains("0%"));
-        assert_eq!(
-            terminal.backend().buffer().cell(Position::new(1, 6)).unwrap().bg,
-            ui_palette().surface
-        );
     }
 
     #[test]
@@ -527,27 +464,6 @@ mod tests {
         assert!(status.ends_with("38%"));
         assert!(!status.contains("  "));
         assert_eq!(fit_status("~/repo", "38%", 80), "~/repo · 38%");
-    }
-
-    #[test]
-    fn derives_low_contrast_surfaces_from_terminal_colors() {
-        let light = palette_for_default_colors(Some(DefaultColors {
-            foreground: (0, 0, 0),
-            background: (255, 255, 255),
-        }));
-        assert_eq!(light.surface, Color::Rgb(244, 244, 244));
-        assert!(light.has_surface);
-
-        let dark = palette_for_default_colors(Some(DefaultColors {
-            foreground: (255, 255, 255),
-            background: (0, 0, 0),
-        }));
-        assert_eq!(dark.surface, Color::Rgb(30, 30, 30));
-        assert!(dark.has_surface);
-
-        let unknown = palette_for_default_colors(None);
-        assert_eq!(unknown.surface, Color::Reset);
-        assert!(!unknown.has_surface);
     }
 
     #[test]

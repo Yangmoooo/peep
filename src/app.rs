@@ -14,6 +14,7 @@ use crate::search::{
     find_next,
 };
 use crate::state::{Bookmark, RecentBook, StateStore, StateWarning, now_unix_ms};
+use crate::theme::ThemeChoice;
 use crate::viewport::{Viewport, VisualLine};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -61,6 +62,7 @@ pub struct App {
     pub(crate) message: Option<String>,
     pub(crate) loading_path: Option<PathBuf>,
     pub(crate) current_match: Option<Range<usize>>,
+    theme_choice: ThemeChoice,
     search_session: Option<SearchSession>,
     bookmarks: Vec<Bookmark>,
     recent_books: Vec<RecentBook>,
@@ -110,6 +112,7 @@ struct SearchContext {
 
 impl App {
     pub fn new(cwd: PathBuf, store: StateStore) -> Self {
+        let theme_choice = store.load_theme();
         Self {
             cwd,
             loaded: None,
@@ -120,6 +123,7 @@ impl App {
             message: None,
             loading_path: None,
             current_match: None,
+            theme_choice,
             search_session: None,
             bookmarks: Vec::new(),
             recent_books: Vec::new(),
@@ -149,6 +153,10 @@ impl App {
     pub fn input_mode(&self) -> InputMode { self.input_mode }
 
     pub fn input(&self) -> &str { &self.input }
+
+    pub fn theme_choice(&self) -> ThemeChoice { self.theme_choice }
+
+    pub fn override_theme(&mut self, theme: ThemeChoice) { self.theme_choice = theme; }
 
     pub fn overlay(&self) -> Option<&OverlayState> { self.overlay.as_ref() }
 
@@ -357,6 +365,7 @@ impl App {
                 ":toc             browse table of contents".to_owned(),
                 ":mark/:marks     add/browse bookmarks".to_owned(),
                 ":recent          browse recent books".to_owned(),
+                ":theme           choose auto/light/dark colors".to_owned(),
                 "Enter/Esc        jump/close a list".to_owned(),
                 ":help            show this help".to_owned(),
                 ":q or Ctrl-C     quit".to_owned(),
@@ -678,6 +687,16 @@ impl App {
             }
             Ok(Command::Help) => {
                 self.show_overlay(OverlayKind::Help, 0);
+            }
+            Ok(Command::Theme(None)) => {
+                self.message = Some(format!("Theme: {}", self.theme_choice));
+            }
+            Ok(Command::Theme(Some(theme))) => {
+                self.theme_choice = theme;
+                self.message = Some(match self.store.save_theme(theme) {
+                    Ok(()) => format!("Theme: {theme}"),
+                    Err(error) => format!("Theme changed to {theme}, but was not saved: {error}"),
+                });
             }
             Err(error) => self.message = Some(error),
         }
@@ -1105,6 +1124,7 @@ enum Command {
     Results,
     Info,
     Help,
+    Theme(Option<ThemeChoice>),
 }
 
 fn parse_command(raw: &str) -> Result<Command, String> {
@@ -1126,6 +1146,12 @@ fn parse_command(raw: &str) -> Result<Command, String> {
         "results" => Ok(Command::Results),
         "info" => Ok(Command::Info),
         "help" | "h" => Ok(Command::Help),
+        "theme" if arguments.is_empty() => Ok(Command::Theme(None)),
+        "theme" => arguments
+            .parse::<ThemeChoice>()
+            .map(Some)
+            .map(Command::Theme)
+            .map_err(|()| "Usage: :theme <auto|light|dark>".to_owned()),
         "goto" => {
             let value = arguments.strip_suffix('%').unwrap_or(arguments);
             let percent = value.parse::<f64>().map_err(|_| "Usage: :goto <0%-100%>".to_owned())?;
@@ -1314,6 +1340,9 @@ mod tests {
         assert_eq!(parse_command("marks").unwrap(), Command::Marks);
         assert_eq!(parse_command("recent").unwrap(), Command::Recent);
         assert_eq!(parse_command("results").unwrap(), Command::Results);
+        assert_eq!(parse_command("theme").unwrap(), Command::Theme(None));
+        assert_eq!(parse_command("theme light").unwrap(), Command::Theme(Some(ThemeChoice::Light)));
+        assert!(parse_command("theme sepia").is_err());
     }
 
     #[test]
@@ -1335,6 +1364,19 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert_eq!(app.composer_text(), "i");
+    }
+
+    #[test]
+    fn theme_command_applies_and_persists_the_preference() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store.clone());
+
+        app.execute_command("theme light");
+
+        assert_eq!(app.theme_choice(), ThemeChoice::Light);
+        assert_eq!(store.load_theme(), ThemeChoice::Light);
+        assert_eq!(app.message.as_deref(), Some("Theme: light"));
     }
 
     #[test]

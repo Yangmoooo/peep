@@ -5,5 +5,6 @@ pub mod search;
 pub mod state;
 pub mod terminal;
 mod terminal_palette;
+pub mod theme;
 pub mod ui;
 pub mod viewport;

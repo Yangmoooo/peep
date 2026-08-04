@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::theme::ThemeChoice;
+
 const STATE_SCHEMA: u32 = 1;
 const BOOKMARK_SCHEMA: u32 = 1;
+const PREFERENCES_SCHEMA: u32 = 1;
 const MAX_RECENT_BOOKS: usize = 100;
 
 #[derive(Clone, Debug)]
@@ -86,6 +89,8 @@ pub enum StateError {
     NewerSchema { path: PathBuf, found: u32, supported: u32 },
     #[error("bookmark file {path} is unreadable and was not overwritten: {reason}")]
     UnreadableBookmarks { path: PathBuf, reason: String },
+    #[error("state file {path} is unreadable and was not overwritten: {reason}")]
+    UnreadableRecord { path: PathBuf, reason: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +151,15 @@ impl From<&Bookmark> for StoredBookmark {
 struct LastOpened {
     schema: u32,
     path: PathBuf,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PreferencesRecord {
+    schema: u32,
+    #[serde(default)]
+    theme: ThemeChoice,
     #[serde(flatten)]
     unknown: BTreeMap<String, Value>,
 }
@@ -366,6 +380,35 @@ impl StateStore {
         )
     }
 
+    pub fn load_theme(&self) -> ThemeChoice {
+        match read_record::<PreferencesRecord>(&self.preferences_path()) {
+            Record::Valid(preferences) if preferences.schema == PREFERENCES_SCHEMA => {
+                preferences.theme
+            }
+            Record::Missing | Record::Invalid(_) | Record::Valid(_) => ThemeChoice::Auto,
+        }
+    }
+
+    pub fn save_theme(&self, theme: ThemeChoice) -> Result<(), StateError> {
+        let path = self.preferences_path();
+        match read_schema(&path) {
+            Record::Valid(found) if found > PREFERENCES_SCHEMA => {
+                return Err(StateError::NewerSchema { path, found, supported: PREFERENCES_SCHEMA });
+            }
+            Record::Invalid(reason) => {
+                return Err(StateError::UnreadableRecord { path, reason });
+            }
+            Record::Missing | Record::Valid(_) => {}
+        }
+        let unknown = match read_record::<PreferencesRecord>(&path) {
+            Record::Valid(preferences) if preferences.schema == PREFERENCES_SCHEMA => {
+                preferences.unknown
+            }
+            Record::Missing | Record::Invalid(_) | Record::Valid(_) => BTreeMap::new(),
+        };
+        self.write_json(&path, &PreferencesRecord { schema: PREFERENCES_SCHEMA, theme, unknown })
+    }
+
     fn load_progress(&self, path: &Path, fingerprint: &str) -> (usize, bool, Vec<StateWarning>) {
         let exact_path = self.book_state_path(path);
         let mut warnings = Vec::new();
@@ -471,6 +514,8 @@ impl StateStore {
     fn book_state_path(&self, path: &Path) -> PathBuf { self.record_path("books", path) }
 
     fn bookmark_state_path(&self, path: &Path) -> PathBuf { self.record_path("bookmarks", path) }
+
+    fn preferences_path(&self) -> PathBuf { self.root.join("preferences.json") }
 
     fn record_path(&self, directory: &str, path: &Path) -> PathBuf {
         let path = canonical_or_owned(path);
@@ -744,6 +789,49 @@ mod tests {
         store.save_last_opened(&path).unwrap();
 
         assert_eq!(store.last_opened(), Some(path));
+    }
+
+    #[test]
+    fn theme_preference_is_independent_and_preserves_unknown_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let path = store.preferences_path();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "theme": "light",
+                "future_field": { "kept": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(store.load_theme(), ThemeChoice::Light);
+        store.save_theme(ThemeChoice::Dark).unwrap();
+
+        let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["future_field"]["kept"], true);
+    }
+
+    #[test]
+    fn refuses_to_overwrite_unreadable_or_newer_theme_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let path = store.preferences_path();
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(
+            store.save_theme(ThemeChoice::Light),
+            Err(StateError::UnreadableRecord { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
+
+        fs::write(&path, r#"{"schema":2,"theme":"future"}"#).unwrap();
+        assert!(matches!(
+            store.save_theme(ThemeChoice::Dark),
+            Err(StateError::NewerSchema { found: 2, .. })
+        ));
     }
 
     #[test]

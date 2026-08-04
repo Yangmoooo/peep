@@ -22,6 +22,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let initial_file = cli.file.clone().or_else(|| store.last_opened());
     let cwd = std::env::current_dir()?;
     let mut app = App::new(cwd, store);
+    if let Some(theme) = cli.theme {
+        app.override_theme(theme);
+    }
     if let Some(path) = initial_file {
         app.start_load(path);
     }
