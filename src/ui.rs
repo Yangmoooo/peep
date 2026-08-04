@@ -71,13 +71,13 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     let surface_style = theme.surface;
     let text = app.composer_text();
     let prompt_style = match app.input_mode() {
-        InputMode::Command | InputMode::Search => {
+        InputMode::Command | InputMode::Search | InputMode::Filter => {
             surface_style.patch(theme.accent).add_modifier(Modifier::BOLD)
         }
         InputMode::Normal => surface_style.patch(theme.muted),
     };
     let text_style = match app.input_mode() {
-        InputMode::Command | InputMode::Search => surface_style,
+        InputMode::Command | InputMode::Search | InputMode::Filter => surface_style,
         InputMode::Normal if app.loading_path.is_some() => surface_style.patch(theme.accent),
         InputMode::Normal if app.message.is_some() => surface_style,
         InputMode::Normal => surface_style.patch(theme.muted),
@@ -425,7 +425,7 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(app.document().unwrap().document().toc().len(), 20);
-        app.overlay = Some(OverlayState { kind: OverlayKind::Toc, selected: 19 });
+        app.overlay = Some(OverlayState::new(OverlayKind::Toc, 19));
 
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();

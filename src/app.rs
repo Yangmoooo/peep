@@ -9,6 +9,7 @@ use directories::UserDirs;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::{DocumentSource, LoadOptions, LoadedDocument, open_document};
+use crate::filter::FilteredList;
 use crate::search::{
     SearchAnalysis, SearchDirection, SearchError, SearchHit, SearchKind, SearchQuery, analyze,
     find_next,
@@ -28,6 +29,7 @@ pub enum InputMode {
     Normal,
     Command,
     Search,
+    Filter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,12 +46,19 @@ impl OverlayKind {
     pub fn is_list(self) -> bool {
         matches!(self, Self::Toc | Self::Bookmarks | Self::Recent | Self::SearchResults)
     }
+
+    fn is_filterable(self) -> bool { matches!(self, Self::Toc | Self::Bookmarks | Self::Recent) }
 }
 
 #[derive(Clone, Debug)]
 pub struct OverlayState {
     pub kind: OverlayKind,
     pub selected: usize,
+    filter: Option<FilteredList>,
+}
+
+impl OverlayState {
+    pub fn new(kind: OverlayKind, selected: usize) -> Self { Self { kind, selected, filter: None } }
 }
 
 pub struct App {
@@ -253,6 +262,7 @@ impl App {
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(event),
             InputMode::Command | InputMode::Search => self.handle_input_key(event),
+            InputMode::Filter => self.input_mode = InputMode::Normal,
         }
     }
 
@@ -301,6 +311,11 @@ impl App {
         match self.input_mode {
             InputMode::Command => self.input.clone(),
             InputMode::Search => format!("/{}", self.input),
+            InputMode::Filter => self
+                .overlay
+                .as_ref()
+                .and_then(|overlay| overlay.filter.as_ref())
+                .map_or_else(String::new, |filter| filter.query().to_owned()),
             InputMode::Normal => {
                 if let Some(path) = &self.loading_path {
                     format!("Loading {}…", path.display())
@@ -320,18 +335,42 @@ impl App {
             OverlayKind::Info => Some("Document info".to_owned()),
             OverlayKind::Toc => {
                 let total = self.loaded.as_ref().map_or(0, |loaded| loaded.document().toc().len());
+                if let Some(filter) = overlay.filter.as_ref().filter(|filter| filter.is_active()) {
+                    return Some(filtered_overlay_title(
+                        "Table of contents",
+                        overlay.selected,
+                        filter.len(),
+                        total,
+                    ));
+                }
                 let current =
                     if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
                 Some(format!("Table of contents · {current}/{total}"))
             }
             OverlayKind::Bookmarks => {
                 let total = self.bookmarks.len();
+                if let Some(filter) = overlay.filter.as_ref().filter(|filter| filter.is_active()) {
+                    return Some(filtered_overlay_title(
+                        "Bookmarks",
+                        overlay.selected,
+                        filter.len(),
+                        total,
+                    ));
+                }
                 let current =
                     if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
                 Some(format!("Bookmarks · {current}/{total}"))
             }
             OverlayKind::Recent => {
                 let total = self.recent_books.len();
+                if let Some(filter) = overlay.filter.as_ref().filter(|filter| filter.is_active()) {
+                    return Some(filtered_overlay_title(
+                        "Recent books",
+                        overlay.selected,
+                        filter.len(),
+                        total,
+                    ));
+                }
                 let current =
                     if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
                 Some(format!("Recent books · {current}/{total}"))
@@ -351,7 +390,33 @@ impl App {
         let Some(overlay) = &self.overlay else {
             return Vec::new();
         };
-        match overlay.kind {
+        let items = self.unfiltered_overlay_items(overlay.kind);
+        let items =
+            if let Some(filter) = overlay.filter.as_ref() { filter.items(&items) } else { items };
+        if !items.is_empty() {
+            return items;
+        }
+        vec![match overlay.kind {
+            OverlayKind::Toc => "No matching chapters".to_owned(),
+            OverlayKind::Bookmarks
+                if overlay.filter.as_ref().is_some_and(|filter| filter.is_active()) =>
+            {
+                "No matching bookmarks".to_owned()
+            }
+            OverlayKind::Bookmarks => "No bookmarks yet; use :mark [label] to add one".to_owned(),
+            OverlayKind::Recent
+                if overlay.filter.as_ref().is_some_and(|filter| filter.is_active()) =>
+            {
+                "No matching recent books".to_owned()
+            }
+            OverlayKind::Recent => "No readable recent books".to_owned(),
+            OverlayKind::SearchResults => "No search results".to_owned(),
+            OverlayKind::Help | OverlayKind::Info => return items,
+        }]
+    }
+
+    fn unfiltered_overlay_items(&self, kind: OverlayKind) -> Vec<String> {
+        match kind {
             OverlayKind::Help => vec![
                 "j/k or ↑/↓       scroll one line".to_owned(),
                 "Ctrl-d/Ctrl-u    scroll half a page".to_owned(),
@@ -497,7 +562,7 @@ impl App {
                         SearchDirection::Forward,
                         None,
                     ),
-                    InputMode::Normal => {}
+                    InputMode::Normal | InputMode::Filter => {}
                 }
             }
             KeyCode::Backspace => {
@@ -522,21 +587,41 @@ impl App {
         let Some(mut overlay) = self.overlay.take() else {
             return;
         };
+        if self.input_mode == InputMode::Filter {
+            self.handle_filter_key(event, overlay);
+            return;
+        }
         let page = self.overlay_page_rows.saturating_sub(1).max(1);
         let half_page = (self.overlay_page_rows / 2).max(1);
         match event.code {
-            KeyCode::Esc => return,
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                return;
+            }
+            KeyCode::Char('/') if overlay.filter.is_some() => {
+                self.input_mode = InputMode::Filter;
+                self.message = None;
+                self.overlay = Some(overlay);
+                return;
+            }
             KeyCode::Enter if overlay.kind == OverlayKind::Toc => {
+                let selected = selected_original_index(&overlay);
                 let offset = self.loaded.as_ref().and_then(|loaded| {
-                    loaded.document().toc().get(overlay.selected).map(|entry| entry.offset())
+                    selected.and_then(|index| {
+                        loaded.document().toc().get(index).map(|entry| entry.offset())
+                    })
                 });
                 if let Some(offset) = offset {
                     self.goto_byte(offset);
+                } else {
+                    self.overlay = Some(overlay);
                 }
                 return;
             }
             KeyCode::Enter if overlay.kind == OverlayKind::Bookmarks => {
-                let offset = self.bookmarks.get(overlay.selected).map(|bookmark| bookmark.position);
+                let offset = selected_original_index(&overlay)
+                    .and_then(|index| self.bookmarks.get(index))
+                    .map(|bookmark| bookmark.position);
                 if let Some(offset) = offset {
                     self.goto_byte(offset);
                 } else {
@@ -545,7 +630,9 @@ impl App {
                 return;
             }
             KeyCode::Enter if overlay.kind == OverlayKind::Recent => {
-                let path = self.recent_books.get(overlay.selected).map(|book| book.path.clone());
+                let path = selected_original_index(&overlay)
+                    .and_then(|index| self.recent_books.get(index))
+                    .map(|book| book.path.clone());
                 if let Some(path) = path {
                     self.start_load(path);
                 } else {
@@ -573,9 +660,17 @@ impl App {
                 return;
             }
             KeyCode::Char('x') if overlay.kind == OverlayKind::Bookmarks => {
-                self.delete_bookmark(overlay.selected);
-                overlay.selected = overlay.selected.min(self.bookmarks.len().saturating_sub(1));
-                self.overlay_max_position = self.bookmarks.len().saturating_sub(1);
+                if let Some(index) = selected_original_index(&overlay) {
+                    self.delete_bookmark(index);
+                }
+                if let Some(filter) = overlay.filter.as_mut() {
+                    filter.refresh(&self.bookmark_items());
+                    overlay.selected = overlay.selected.min(filter.len().saturating_sub(1));
+                    self.overlay_max_position = filter.len().saturating_sub(1);
+                } else {
+                    overlay.selected = overlay.selected.min(self.bookmarks.len().saturating_sub(1));
+                    self.overlay_max_position = self.bookmarks.len().saturating_sub(1);
+                }
                 self.overlay = Some(overlay);
                 return;
             }
@@ -611,6 +706,49 @@ impl App {
         self.overlay = Some(overlay);
     }
 
+    fn handle_filter_key(&mut self, event: KeyEvent, mut overlay: OverlayState) {
+        match event.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Backspace => {
+                let mut query = overlay
+                    .filter
+                    .as_ref()
+                    .map_or_else(String::new, |filter| filter.query().into());
+                if let Some((start, _)) = query.grapheme_indices(true).next_back() {
+                    query.truncate(start);
+                }
+                self.update_overlay_filter(&mut overlay, query);
+            }
+            KeyCode::Char('u') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.update_overlay_filter(&mut overlay, String::new());
+            }
+            KeyCode::Char(character)
+                if !event.modifiers.contains(KeyModifiers::CONTROL)
+                    && !event.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let mut query = overlay
+                    .filter
+                    .as_ref()
+                    .map_or_else(String::new, |filter| filter.query().into());
+                query.push(character);
+                self.update_overlay_filter(&mut overlay, query);
+            }
+            _ => {}
+        }
+        self.overlay = Some(overlay);
+    }
+
+    fn update_overlay_filter(&mut self, overlay: &mut OverlayState, query: String) {
+        let labels = self.unfiltered_overlay_items(overlay.kind);
+        if let Some(filter) = overlay.filter.as_mut() {
+            overlay.selected = filter.update(query, &labels, overlay.selected);
+            self.overlay_max_position = filter.len().saturating_sub(1);
+            self.overlay_list_offset = 0;
+        }
+    }
+
     fn begin_input(&mut self, mode: InputMode) {
         self.input_mode = mode;
         self.input.clear();
@@ -618,7 +756,13 @@ impl App {
     }
 
     fn show_overlay(&mut self, kind: OverlayKind, selected: usize) {
-        self.overlay = Some(OverlayState { kind, selected });
+        let total = self.unfiltered_overlay_items(kind).len();
+        let mut overlay = OverlayState::new(kind, selected);
+        if kind.is_filterable() && total > 0 {
+            overlay.filter = Some(FilteredList::new(total));
+        }
+        self.input_mode = InputMode::Normal;
+        self.overlay = Some(overlay);
         self.overlay_list_offset = 0;
     }
 
@@ -969,10 +1113,10 @@ impl App {
 
     fn bookmark_items(&self) -> Vec<String> {
         let Some(loaded) = self.loaded.as_ref() else {
-            return vec!["No document is open".to_owned()];
+            return Vec::new();
         };
         if self.bookmarks.is_empty() {
-            return vec!["No bookmarks yet; use :mark [label] to add one".to_owned()];
+            return Vec::new();
         }
         let text = loaded.document().text();
         let total_chars = loaded.document().total_chars().max(1);
@@ -996,7 +1140,7 @@ impl App {
 
     fn recent_items(&self) -> Vec<String> {
         if self.recent_books.is_empty() {
-            return vec!["No readable recent books".to_owned()];
+            return Vec::new();
         }
         let now = now_unix_ms();
         self.recent_books
@@ -1020,10 +1164,10 @@ impl App {
     fn search_result_items(&self) -> Vec<String> {
         let (Some(loaded), Some(session)) = (self.loaded.as_ref(), self.search_session.as_ref())
         else {
-            return vec!["No search results".to_owned()];
+            return Vec::new();
         };
         if session.previews.is_empty() {
-            return vec!["No search results".to_owned()];
+            return Vec::new();
         }
         session
             .previews
@@ -1174,6 +1318,18 @@ fn unquote(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn selected_original_index(overlay: &OverlayState) -> Option<usize> {
+    overlay
+        .filter
+        .as_ref()
+        .map_or(Some(overlay.selected), |filter| filter.original_index(overlay.selected))
+}
+
+fn filtered_overlay_title(name: &str, selected: usize, matches: usize, total: usize) -> String {
+    let current = if matches == 0 { 0 } else { selected.min(matches - 1) + 1 };
+    format!("{name} · {current}/{matches} matches · {total} total")
 }
 
 fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
@@ -1384,7 +1540,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path().join("state")).unwrap();
         let mut app = App::new(directory.path().to_path_buf(), store);
-        app.overlay = Some(OverlayState { kind: OverlayKind::Info, selected: 0 });
+        app.overlay = Some(OverlayState::new(OverlayKind::Info, 0));
         app.set_overlay_layout(20, 5);
 
         app.scroll_mouse(3);
@@ -1415,7 +1571,7 @@ mod tests {
         let (_directory, mut app) = app_with_text(&text);
         assert_eq!(app.document().unwrap().document().toc().len(), 20);
 
-        app.overlay = Some(OverlayState { kind: OverlayKind::Toc, selected: 0 });
+        app.overlay = Some(OverlayState::new(OverlayKind::Toc, 0));
         app.set_overlay_layout(20, 5);
         assert_eq!(app.overlay_title().as_deref(), Some("Table of contents · 1/20"));
 
@@ -1448,7 +1604,7 @@ mod tests {
             .collect::<String>();
         let (_directory, mut app) = app_with_text(&text);
         let target = app.document().unwrap().document().toc()[2].offset();
-        app.overlay = Some(OverlayState { kind: OverlayKind::Toc, selected: usize::MAX });
+        app.overlay = Some(OverlayState::new(OverlayKind::Toc, usize::MAX));
 
         app.set_overlay_layout(3, 0);
         assert_eq!(app.overlay().unwrap().selected, 2);
@@ -1458,6 +1614,55 @@ mod tests {
 
         assert!(app.overlay().is_none());
         assert_eq!(app.viewport.as_ref().unwrap().anchor(), target);
+    }
+
+    #[test]
+    fn toc_filter_keeps_visible_and_original_indices_separate() {
+        let text = (1..=12)
+            .map(|number| format!("第{number}章 标题{number}\n正文。\n"))
+            .collect::<String>();
+        let (_directory, mut app) = app_with_text(&text);
+        let target = app.document().unwrap().document().toc()[11].offset();
+        app.execute_command("toc");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "第１２章标题１２".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        assert_eq!(app.input_mode(), InputMode::Filter);
+        assert_eq!(app.composer_text(), "第１２章标题１２");
+        assert_eq!(app.overlay_items(), ["第12章 标题12"]);
+        assert_eq!(
+            app.overlay_title().as_deref(),
+            Some("Table of contents · 1/1 matches · 12 total")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input_mode(), InputMode::Normal);
+        assert!(app.overlay().is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.overlay().is_none());
+        assert_eq!(app.viewport.as_ref().unwrap().anchor(), target);
+    }
+
+    #[test]
+    fn unmatched_filter_stays_open_and_can_be_cleared() {
+        let (_directory, mut app) = app_with_text("第一章 风起\n正文。");
+        app.execute_command("toc");
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "没有".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.overlay_items(), ["No matching chapters"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.overlay().is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.overlay_items(), ["第一章 风起"]);
     }
 
     #[test]
@@ -1481,7 +1686,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path().join("state")).unwrap();
         let mut app = App::new(directory.path().to_path_buf(), store);
-        app.overlay = Some(OverlayState { kind: OverlayKind::Help, selected: 0 });
+        app.overlay = Some(OverlayState::new(OverlayKind::Help, 0));
         let help = app.overlay_items().join("\n");
 
         assert!(help.contains("→/←"));
@@ -1523,6 +1728,27 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.overlay().is_none());
         assert_eq!(app.viewport.as_ref().unwrap().anchor(), 0);
+    }
+
+    #[test]
+    fn filtered_bookmark_deletion_uses_the_original_index() {
+        let text = "第一章 风起\n正文。\n第二章 云涌\n正文。";
+        let (_directory, mut app) = app_with_text(text);
+        app.execute_command("mark keep");
+        app.goto_byte(text.find("第二章").unwrap());
+        app.execute_command("mark delete-me");
+        app.execute_command("marks");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "delete-me".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(app.bookmarks.len(), 1);
+        assert_eq!(app.bookmarks[0].label.as_deref(), Some("keep"));
+        assert_eq!(app.overlay_items(), ["No matching bookmarks"]);
     }
 
     #[test]
