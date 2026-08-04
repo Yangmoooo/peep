@@ -9,6 +9,9 @@ Peep 是一个本地、离线的终端 EPUB/TXT 阅读器。界面保持为克�
 - 连续滚动、Unicode 宽度感知折行和稳定阅读位置。
 - Vim 风格导航、宽松/精确/正则搜索和章节跳转。
 - 独立保存的书签与最近阅读列表。
+- 目录、书签和最近阅读浮窗的实时宽松过滤。
+- 可即时切换并保存的自动、亮色和暗色主题。
+- 可用方向键浏览的跨会话命令与搜索历史。
 - 自动保存进度；文件仅改名或移动时通过 BLAKE3 恢复。
 - macOS、Linux 和 Windows Terminal。
 - 完全离线，无模型调用、遥测或远程 EPUB 资源加载。
@@ -36,7 +39,7 @@ peep path/to/book.epub
 或直接安装 Git tag 对应的版本：
 
 ```bash
-cargo install --git https://github.com/Yangmoooo/peep --tag v0.1.0 --locked
+cargo install --git https://github.com/Yangmoooo/peep --tag v0.3.0 --locked
 ```
 
 不带参数运行会恢复最近阅读的文件：
@@ -49,6 +52,13 @@ peep
 
 ```bash
 peep --no-mouse book.txt
+```
+
+默认主题会根据终端颜色自动选择，也可以仅为本次运行覆盖已保存的主题：
+
+```bash
+peep --theme light book.txt
+peep --theme dark book.epub
 ```
 
 ## 阅读操作
@@ -64,6 +74,8 @@ peep --no-mouse book.txt
 | `n` / `N` | 下一个/上一个搜索结果 |
 | `Ctrl-C` | 退出 |
 
+在命令或搜索输入框中，`↑` / `↓` 可以浏览各自的历史，并在越过最新记录时恢复输入前的草稿。
+
 底部输入框支持：
 
 ```text
@@ -77,6 +89,8 @@ peep --no-mouse book.txt
 :results        浏览最近一次搜索的结果
 :goto <percent> 跳到百分比位置
 :info           文件和恢复警告
+:theme [name]   查看或切换 auto/light/dark 主题
+:history clear  清除命令和搜索历史
 :help           快捷键帮助
 :q              退出
 ```
@@ -84,9 +98,13 @@ peep --no-mouse book.txt
 所有浮窗都支持 `j/k`、方向键、`Ctrl-d/Ctrl-u`、`Space/b`、
 `PageUp/PageDown` 和 `Home/End` 导航。目录、书签、最近阅读和搜索结果浮窗可用
 `Enter` 跳转或打开，书签浮窗使用 `x` 删除所选书签；`Esc` 关闭浮窗。
+在目录、书签和最近阅读浮窗中按 `/` 会聚焦底部输入框并实时过滤；`Enter` 或
+`Esc` 返回列表，清空过滤词即可恢复完整列表。过滤使用与默认全文搜索相同的宽松匹配规则。
 
 默认 `/text` 是宽松字面搜索，只容忍排版差异，不会跳过额外的正文字符或跨越换行。
-使用 `:exact` 搜索必须完全一致的文本，使用 `:re` 执行正则搜索；搜索词和结果不会写入磁盘。
+使用 `:exact` 搜索必须完全一致的文本，使用 `:re` 执行正则搜索。命令和 `/text` 搜索词
+分别保留最近 100 条；可用 `:history clear commands`、`:history clear searches` 或
+`:history clear all` 单独清理。浮窗过滤词和搜索结果正文不会写入磁盘。
 
 启用鼠标捕获时，大多数终端使用 `Shift` + 拖动进行原生文本选择。
 
@@ -107,7 +125,8 @@ TXT 保留原始换行，并以严格的行首规则识别 `第N章/回`、`第N
 - Windows：用户的 Local App Data 目录下的 `peep`
 
 每本书的进度和书签使用分开的原子 JSON 记录。路径相同则直接恢复；路径变化但文件字节完全相同时，
-通过 BLAKE3 指纹恢复完整阅读状态。书签不会因为频繁保存阅读进度而被重写。
+通过 BLAKE3 指纹恢复完整阅读状态。书签不会因为频繁保存阅读进度而被重写。主题偏好和输入历史也使用
+各自独立、带 schema 的原子 JSON 记录，不会改变现有进度或书签格式。
 
 ## 开发
 

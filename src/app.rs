@@ -436,6 +436,8 @@ impl App {
                 ":toc             browse table of contents".to_owned(),
                 ":mark/:marks     add/browse bookmarks".to_owned(),
                 ":recent          browse recent books".to_owned(),
+                "/ in a list      filter toc/bookmarks/recent".to_owned(),
+                "↑/↓ in input     browse saved input history".to_owned(),
                 ":theme           choose auto/light/dark colors".to_owned(),
                 ":history clear   clear command/search history".to_owned(),
                 "Enter/Esc        jump/close a list".to_owned(),

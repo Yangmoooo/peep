@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-04
+
+### Added
+
+- **终端主题**：提供 `auto`、`light` 和 `dark` 三种内置主题；可用 `--theme` 临时覆盖，或使用 `:theme` 即时切换并保存偏好。
+- **浮窗快速过滤**：目录、书签和最近阅读浮窗支持通过 `/` 实时过滤，匹配会容忍空白、标点、大小写和常见全半角差异，并保持跳转与删除目标准确。
+- **输入历史**：命令与全文搜索分别保存最近 100 条记录，支持使用 `↑/↓` 跨会话浏览和恢复草稿，并可通过 `:history clear` 清理。
+
 ### Fixed
 
 - **浮窗列表导航**：目录、书签、最近阅读和搜索结果浮窗现在会保留滚动位置，向上移动选中项时不再让列表始终贴着底部滚动；包含空格的选中行也会完整刷新高亮背景。
@@ -36,6 +44,7 @@
 - **TXT 章节识别**：自动识别常见的章、回、卷、部、集及复合卷章结构，同时尽量避免把正文中的编号误判为章节。
 - **跨平台支持**：可运行于 macOS、Linux 和 Windows Terminal。
 
-[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Yangmoooo/peep/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Yangmoooo/peep/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Yangmoooo/peep/releases/tag/v0.1.0
