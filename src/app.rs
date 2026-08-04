@@ -10,11 +10,12 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::{DocumentSource, LoadOptions, LoadedDocument, open_document};
 use crate::filter::FilteredList;
+use crate::history::InputHistory;
 use crate::search::{
     SearchAnalysis, SearchDirection, SearchError, SearchHit, SearchKind, SearchQuery, analyze,
     find_next,
 };
-use crate::state::{Bookmark, RecentBook, StateStore, StateWarning, now_unix_ms};
+use crate::state::{Bookmark, RecentBook, SavedHistory, StateStore, StateWarning, now_unix_ms};
 use crate::theme::ThemeChoice;
 use crate::viewport::{Viewport, VisualLine};
 
@@ -67,6 +68,8 @@ pub struct App {
     pub(crate) viewport: Option<Viewport>,
     pub(crate) input_mode: InputMode,
     pub(crate) input: String,
+    command_history: InputHistory,
+    search_history: InputHistory,
     pub(crate) overlay: Option<OverlayState>,
     pub(crate) message: Option<String>,
     pub(crate) loading_path: Option<PathBuf>,
@@ -122,12 +125,15 @@ struct SearchContext {
 impl App {
     pub fn new(cwd: PathBuf, store: StateStore) -> Self {
         let theme_choice = store.load_theme();
+        let history = store.load_history();
         Self {
             cwd,
             loaded: None,
             viewport: None,
             input_mode: InputMode::Normal,
             input: String::new(),
+            command_history: InputHistory::new(history.commands),
+            search_history: InputHistory::new(history.searches),
             overlay: None,
             message: None,
             loading_path: None,
@@ -431,6 +437,7 @@ impl App {
                 ":mark/:marks     add/browse bookmarks".to_owned(),
                 ":recent          browse recent books".to_owned(),
                 ":theme           choose auto/light/dark colors".to_owned(),
+                ":history clear   clear command/search history".to_owned(),
                 "Enter/Esc        jump/close a list".to_owned(),
                 ":help            show this help".to_owned(),
                 ":q or Ctrl-C     quit".to_owned(),
@@ -550,18 +557,31 @@ impl App {
         match event.code {
             KeyCode::Esc => {
                 self.input.clear();
+                self.reset_active_history_navigation();
                 self.input_mode = InputMode::Normal;
             }
+            KeyCode::Up => self.navigate_input_history(true),
+            KeyCode::Down => self.navigate_input_history(false),
             KeyCode::Enter => {
                 let input = std::mem::take(&mut self.input);
                 let mode = std::mem::replace(&mut self.input_mode, InputMode::Normal);
                 match mode {
-                    InputMode::Command => self.execute_command(&input),
-                    InputMode::Search => self.start_search(
-                        SearchQuery::new(SearchKind::LooseLiteral, input),
-                        SearchDirection::Forward,
-                        None,
-                    ),
+                    InputMode::Command => {
+                        let clears_history =
+                            matches!(parse_command(&input), Ok(Command::ClearHistory(_)));
+                        self.execute_command(&input);
+                        if !clears_history {
+                            self.record_input_history(InputMode::Command, &input);
+                        }
+                    }
+                    InputMode::Search => {
+                        self.start_search(
+                            SearchQuery::new(SearchKind::LooseLiteral, input.clone()),
+                            SearchDirection::Forward,
+                            None,
+                        );
+                        self.record_input_history(InputMode::Search, &input);
+                    }
                     InputMode::Normal | InputMode::Filter => {}
                 }
             }
@@ -580,6 +600,54 @@ impl App {
                 self.input.push(character);
             }
             _ => {}
+        }
+    }
+
+    fn navigate_input_history(&mut self, previous: bool) {
+        let current = self.input.clone();
+        let replacement = match self.input_mode {
+            InputMode::Command if previous => self.command_history.previous(&current),
+            InputMode::Command => self.command_history.next(),
+            InputMode::Search if previous => self.search_history.previous(&current),
+            InputMode::Search => self.search_history.next(),
+            InputMode::Normal | InputMode::Filter => None,
+        };
+        if let Some(replacement) = replacement {
+            self.input = replacement;
+        }
+    }
+
+    fn reset_active_history_navigation(&mut self) {
+        match self.input_mode {
+            InputMode::Command => self.command_history.reset_navigation(),
+            InputMode::Search => self.search_history.reset_navigation(),
+            InputMode::Normal | InputMode::Filter => {}
+        }
+    }
+
+    fn record_input_history(&mut self, mode: InputMode, value: &str) {
+        let changed = match mode {
+            InputMode::Command => self.command_history.record(value),
+            InputMode::Search => self.search_history.record(value),
+            InputMode::Normal | InputMode::Filter => false,
+        };
+        if changed {
+            self.save_input_history();
+        }
+    }
+
+    fn save_input_history(&mut self) {
+        let history = SavedHistory {
+            commands: self.command_history.entries().to_vec(),
+            searches: self.search_history.entries().to_vec(),
+        };
+        if let Err(error) = self.store.save_history(&history) {
+            let suffix = format!("history was not saved: {error}");
+            self.message = Some(
+                self.message
+                    .take()
+                    .map_or(suffix.clone(), |message| format!("{message}; {suffix}")),
+            );
         }
     }
 
@@ -752,6 +820,7 @@ impl App {
     fn begin_input(&mut self, mode: InputMode) {
         self.input_mode = mode;
         self.input.clear();
+        self.reset_active_history_navigation();
         self.message = None;
     }
 
@@ -842,8 +911,26 @@ impl App {
                     Err(error) => format!("Theme changed to {theme}, but was not saved: {error}"),
                 });
             }
+            Ok(Command::ClearHistory(scope)) => self.clear_input_history(scope),
             Err(error) => self.message = Some(error),
         }
+    }
+
+    fn clear_input_history(&mut self, scope: HistoryScope) {
+        match scope {
+            HistoryScope::All => {
+                self.command_history.clear();
+                self.search_history.clear();
+            }
+            HistoryScope::Commands => self.command_history.clear(),
+            HistoryScope::Searches => self.search_history.clear(),
+        }
+        self.message = Some(match scope {
+            HistoryScope::All => "History cleared".to_owned(),
+            HistoryScope::Commands => "Command history cleared".to_owned(),
+            HistoryScope::Searches => "Search history cleared".to_owned(),
+        });
+        self.save_input_history();
     }
 
     fn start_search(
@@ -1269,6 +1356,14 @@ enum Command {
     Info,
     Help,
     Theme(Option<ThemeChoice>),
+    ClearHistory(HistoryScope),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryScope {
+    All,
+    Commands,
+    Searches,
 }
 
 fn parse_command(raw: &str) -> Result<Command, String> {
@@ -1296,6 +1391,12 @@ fn parse_command(raw: &str) -> Result<Command, String> {
             .map(Some)
             .map(Command::Theme)
             .map_err(|()| "Usage: :theme <auto|light|dark>".to_owned()),
+        "history" => match arguments {
+            "clear" | "clear all" => Ok(Command::ClearHistory(HistoryScope::All)),
+            "clear commands" => Ok(Command::ClearHistory(HistoryScope::Commands)),
+            "clear searches" => Ok(Command::ClearHistory(HistoryScope::Searches)),
+            _ => Err("Usage: :history clear [commands|searches|all]".to_owned()),
+        },
         "goto" => {
             let value = arguments.strip_suffix('%').unwrap_or(arguments);
             let percent = value.parse::<f64>().map_err(|_| "Usage: :goto <0%-100%>".to_owned())?;
@@ -1499,6 +1600,15 @@ mod tests {
         assert_eq!(parse_command("theme").unwrap(), Command::Theme(None));
         assert_eq!(parse_command("theme light").unwrap(), Command::Theme(Some(ThemeChoice::Light)));
         assert!(parse_command("theme sepia").is_err());
+        assert_eq!(
+            parse_command("history clear").unwrap(),
+            Command::ClearHistory(HistoryScope::All)
+        );
+        assert_eq!(
+            parse_command("history clear searches").unwrap(),
+            Command::ClearHistory(HistoryScope::Searches)
+        );
+        assert!(parse_command("history").is_err());
     }
 
     #[test]
@@ -1533,6 +1643,57 @@ mod tests {
         assert_eq!(app.theme_choice(), ThemeChoice::Light);
         assert_eq!(store.load_theme(), ThemeChoice::Light);
         assert_eq!(app.message.as_deref(), Some("Theme: light"));
+    }
+
+    #[test]
+    fn command_history_restores_a_cross_session_draft_with_up_and_down() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut first = App::new(directory.path().to_path_buf(), store.clone());
+        first.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in "unknown-command".chars() {
+            first.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        first.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mut second = App::new(directory.path().to_path_buf(), store);
+        second.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in "draft".chars() {
+            second.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        second.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(second.composer_text(), "unknown-command");
+        second.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(second.composer_text(), "draft");
+    }
+
+    #[test]
+    fn search_history_is_persisted_separately_and_can_be_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let book = directory.path().join("book.txt");
+        fs::write(&book, "第一章 风起").unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let loaded =
+            open_document(DocumentSource::from_path(book), LoadOptions::default()).unwrap();
+        let mut first = App::new(directory.path().to_path_buf(), store.clone());
+        first.install_document(loaded);
+        first.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "风起".chars() {
+            first.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        first.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mut second = App::new(directory.path().to_path_buf(), store.clone());
+        second.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        second.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(second.composer_text(), "/风起");
+        second.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        second.execute_command("history clear searches");
+
+        let mut third = App::new(directory.path().to_path_buf(), store);
+        third.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        third.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(third.composer_text(), "/");
     }
 
     #[test]
@@ -1695,6 +1856,7 @@ mod tests {
         assert!(help.contains(":mark/:marks"));
         assert!(help.contains(":recent"));
         assert!(help.contains(":exact/:re"));
+        assert!(help.contains(":history clear"));
     }
 
     #[test]

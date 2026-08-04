@@ -14,6 +14,7 @@ use crate::theme::ThemeChoice;
 const STATE_SCHEMA: u32 = 1;
 const BOOKMARK_SCHEMA: u32 = 1;
 const PREFERENCES_SCHEMA: u32 = 1;
+const HISTORY_SCHEMA: u32 = 1;
 const MAX_RECENT_BOOKS: usize = 100;
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,12 @@ pub struct RecentBook {
 pub struct RecentBooks {
     pub books: Vec<RecentBook>,
     pub warnings: Vec<StateWarning>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SavedHistory {
+    pub commands: Vec<String>,
+    pub searches: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +167,17 @@ struct PreferencesRecord {
     schema: u32,
     #[serde(default)]
     theme: ThemeChoice,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HistoryRecord {
+    schema: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    searches: Vec<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, Value>,
 }
@@ -409,6 +427,41 @@ impl StateStore {
         self.write_json(&path, &PreferencesRecord { schema: PREFERENCES_SCHEMA, theme, unknown })
     }
 
+    pub fn load_history(&self) -> SavedHistory {
+        match read_record::<HistoryRecord>(&self.history_path()) {
+            Record::Valid(history) if history.schema == HISTORY_SCHEMA => {
+                SavedHistory { commands: history.commands, searches: history.searches }
+            }
+            Record::Missing | Record::Invalid(_) | Record::Valid(_) => SavedHistory::default(),
+        }
+    }
+
+    pub fn save_history(&self, history: &SavedHistory) -> Result<(), StateError> {
+        let path = self.history_path();
+        match read_schema(&path) {
+            Record::Valid(found) if found > HISTORY_SCHEMA => {
+                return Err(StateError::NewerSchema { path, found, supported: HISTORY_SCHEMA });
+            }
+            Record::Invalid(reason) => {
+                return Err(StateError::UnreadableRecord { path, reason });
+            }
+            Record::Missing | Record::Valid(_) => {}
+        }
+        let unknown = match read_record::<HistoryRecord>(&path) {
+            Record::Valid(history) if history.schema == HISTORY_SCHEMA => history.unknown,
+            Record::Missing | Record::Invalid(_) | Record::Valid(_) => BTreeMap::new(),
+        };
+        self.write_json(
+            &path,
+            &HistoryRecord {
+                schema: HISTORY_SCHEMA,
+                commands: history.commands.clone(),
+                searches: history.searches.clone(),
+                unknown,
+            },
+        )
+    }
+
     fn load_progress(&self, path: &Path, fingerprint: &str) -> (usize, bool, Vec<StateWarning>) {
         let exact_path = self.book_state_path(path);
         let mut warnings = Vec::new();
@@ -516,6 +569,8 @@ impl StateStore {
     fn bookmark_state_path(&self, path: &Path) -> PathBuf { self.record_path("bookmarks", path) }
 
     fn preferences_path(&self) -> PathBuf { self.root.join("preferences.json") }
+
+    fn history_path(&self) -> PathBuf { self.root.join("history.json") }
 
     fn record_path(&self, directory: &str, path: &Path) -> PathBuf {
         let path = canonical_or_owned(path);
@@ -830,6 +885,53 @@ mod tests {
         fs::write(&path, r#"{"schema":2,"theme":"future"}"#).unwrap();
         assert!(matches!(
             store.save_theme(ThemeChoice::Dark),
+            Err(StateError::NewerSchema { found: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn history_is_independent_and_preserves_unknown_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let path = store.history_path();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "commands": ["toc"],
+                "searches": ["第一章"],
+                "future_field": { "kept": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut history = store.load_history();
+        assert_eq!(history.commands, ["toc"]);
+        assert_eq!(history.searches, ["第一章"]);
+        history.commands.push("recent".to_owned());
+        store.save_history(&history).unwrap();
+
+        let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["commands"], serde_json::json!(["toc", "recent"]));
+        assert_eq!(value["future_field"]["kept"], true);
+    }
+
+    #[test]
+    fn refuses_to_overwrite_unreadable_or_newer_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let path = store.history_path();
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(
+            store.save_history(&SavedHistory::default()),
+            Err(StateError::UnreadableRecord { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
+
+        fs::write(&path, r#"{"schema":2,"entries":[]}"#).unwrap();
+        assert!(matches!(
+            store.save_history(&SavedHistory::default()),
             Err(StateError::NewerSchema { found: 2, .. })
         ));
     }

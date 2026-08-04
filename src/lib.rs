@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod document;
 mod filter;
+mod history;
 mod loose_match;
 pub mod search;
 pub mod state;
