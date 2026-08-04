@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use directories::UserDirs;
 use ratatui::Frame;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -218,7 +219,32 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, body: Rect) {
     let mut state =
         ListState::default().with_selected(Some(selected)).with_offset(app.overlay_list_offset());
     frame.render_stateful_widget(list, area, &mut state);
+    force_redraw_selected_list_row(frame, area, selected, state.offset());
     app.set_overlay_list_offset(state.offset());
+}
+
+fn force_redraw_selected_list_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected: usize,
+    offset: usize,
+) {
+    let list_area = area.inner(Margin { horizontal: 1, vertical: 1 });
+    let Some(relative_row) = selected.checked_sub(offset) else {
+        return;
+    };
+    let Ok(relative_row) = u16::try_from(relative_row) else {
+        return;
+    };
+    if relative_row >= list_area.height {
+        return;
+    }
+    let y = list_area.y.saturating_add(relative_row);
+    for x in list_area.left()..list_area.right() {
+        if let Some(cell) = frame.buffer_mut().cell_mut(Position::new(x, y)) {
+            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
 }
 
 fn styled_line<'a>(
@@ -468,6 +494,13 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bottom_row = selected_overlay_row(&terminal, 8);
+        let title_separator = terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(11, bottom_row))
+            .expect("space between chapter number and title");
+        assert_eq!(title_separator.symbol(), " ");
+        assert_eq!(title_separator.diff_option, CellDiffOption::AlwaysUpdate);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
