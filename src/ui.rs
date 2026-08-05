@@ -261,14 +261,26 @@ fn styled_line<'a>(
             let end = window[1];
             (start < end).then(|| {
                 let mut style = theme.body;
-                for text_style in document.styles() {
-                    let style_range = text_style.range();
-                    if start >= style_range.start && start < style_range.end {
-                        style = match text_style.kind() {
-                            TextStyleKind::Emphasis => style.add_modifier(Modifier::ITALIC),
-                            TextStyleKind::Strong => style.add_modifier(Modifier::BOLD),
-                            TextStyleKind::Heading(_) => style.patch(theme.heading),
-                        };
+                for layer in 0..2 {
+                    for text_style in document.styles() {
+                        let kind = text_style.kind();
+                        let style_range = text_style.range();
+                        if text_style_layer(kind) == layer
+                            && start >= style_range.start
+                            && start < style_range.end
+                        {
+                            style = match kind {
+                                TextStyleKind::Code => style.patch(theme.code),
+                                TextStyleKind::Emphasis => style.add_modifier(Modifier::ITALIC),
+                                TextStyleKind::Link => style.patch(theme.link),
+                                TextStyleKind::Quote => style.patch(theme.quote),
+                                TextStyleKind::Strikethrough => {
+                                    style.add_modifier(Modifier::CROSSED_OUT)
+                                }
+                                TextStyleKind::Strong => style.add_modifier(Modifier::BOLD),
+                                TextStyleKind::Heading(_) => style.patch(theme.heading),
+                            };
+                        }
                     }
                 }
                 if current_match
@@ -282,6 +294,17 @@ fn styled_line<'a>(
         })
         .collect::<Vec<_>>();
     Line::from(spans)
+}
+
+fn text_style_layer(kind: TextStyleKind) -> u8 {
+    match kind {
+        TextStyleKind::Quote | TextStyleKind::Heading(_) => 0,
+        TextStyleKind::Code
+        | TextStyleKind::Emphasis
+        | TextStyleKind::Link
+        | TextStyleKind::Strikethrough
+        | TextStyleKind::Strong => 1,
+    }
 }
 
 fn intersects(left: &Range<usize>, right: &Range<usize>) -> bool {

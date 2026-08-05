@@ -5,7 +5,11 @@ use clap::Parser;
 use crate::theme::ThemeChoice;
 
 #[derive(Clone, Debug, Parser)]
-#[command(name = "peep", version, about = "Read EPUB and TXT files in a quiet terminal interface")]
+#[command(
+    name = "peep",
+    version,
+    about = "Read EPUB, TXT, and Markdown files in a quiet terminal interface"
+)]
 pub struct Cli {
     /// Do not capture mouse events; keeps native terminal text selection.
     #[arg(long)]
@@ -15,7 +19,8 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub theme: Option<ThemeChoice>,
 
-    /// EPUB or TXT file to open. Reopens the most recent file when omitted.
+    /// EPUB, TXT, or Markdown file to open. Reopens the most recent file when
+    /// omitted.
     pub file: Option<PathBuf>,
 }
 

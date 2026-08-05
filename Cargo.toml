@@ -1,8 +1,8 @@
 [package]
 name = "peep"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-description = "A quiet terminal reader for Chinese novels"
+description = "A quiet terminal reader for EPUB, TXT, and Markdown"
 rust-version = "1.88"
 license = "MIT"
 publish = false
@@ -15,6 +15,7 @@ directories = "6.0"
 ego-tree = "0.11"
 encoding_rs = "0.8"
 percent-encoding = "2.3"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm",
 ] }

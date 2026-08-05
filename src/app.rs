@@ -403,7 +403,7 @@ impl App {
             return items;
         }
         vec![match overlay.kind {
-            OverlayKind::Toc => "No matching chapters".to_owned(),
+            OverlayKind::Toc => "No matching sections".to_owned(),
             OverlayKind::Bookmarks
                 if overlay.filter.as_ref().is_some_and(|filter| filter.is_active()) =>
             {
@@ -429,7 +429,7 @@ impl App {
                 "Space/b or →/←   scroll one page".to_owned(),
                 "PgDn/PgUp        scroll one page".to_owned(),
                 "g/G or Home/End  start/end".to_owned(),
-                "[/]              previous/next chapter".to_owned(),
+                "[/]              previous/next section".to_owned(),
                 "/text, n/N       search".to_owned(),
                 ":exact/:re       exact/regex search".to_owned(),
                 ":results         browse search results".to_owned(),
@@ -1817,7 +1817,7 @@ mod tests {
         for character in "没有".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
-        assert_eq!(app.overlay_items(), ["No matching chapters"]);
+        assert_eq!(app.overlay_items(), ["No matching sections"]);
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

@@ -6,6 +6,7 @@
 
 mod chapter;
 mod epub;
+mod markdown;
 mod toc;
 mod txt;
 
@@ -18,6 +19,7 @@ use thiserror::Error;
 
 pub(crate) use self::chapter::detect_chapter_headings;
 use self::epub::EpubAdapter;
+use self::markdown::MarkdownAdapter;
 use self::txt::TxtAdapter;
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -57,6 +59,7 @@ impl Default for LoadOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentFormat {
     Epub,
+    Markdown,
     Txt,
 }
 
@@ -64,6 +67,7 @@ impl std::fmt::Display for DocumentFormat {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Epub => formatter.write_str("EPUB"),
+            Self::Markdown => formatter.write_str("MD"),
             Self::Txt => formatter.write_str("TXT"),
         }
     }
@@ -113,7 +117,11 @@ impl TocEntry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextStyleKind {
+    Code,
     Emphasis,
+    Link,
+    Quote,
+    Strikethrough,
     Strong,
     Heading(u8),
 }
@@ -249,6 +257,8 @@ pub enum LoadError {
     UnsupportedFormat(PathBuf),
     #[error("TXT is neither valid UTF-8 nor valid GB18030")]
     InvalidTextEncoding,
+    #[error("Markdown is not valid UTF-8")]
+    InvalidMarkdownEncoding,
     #[error("invalid EPUB: {0}")]
     InvalidEpub(String),
 }
@@ -309,7 +319,7 @@ pub fn open_document(
     }
 
     let prefix = &bytes[..bytes.len().min(4096)];
-    let adapters: [&dyn FormatAdapter; 2] = [&EpubAdapter, &TxtAdapter];
+    let adapters: [&dyn FormatAdapter; 3] = [&EpubAdapter, &MarkdownAdapter, &TxtAdapter];
     let adapter = adapters
         .into_iter()
         .max_by_key(|adapter| adapter.probe(&requested_path, prefix))
