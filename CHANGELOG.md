@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-05
+
 ### Added
 
 - **Markdown 阅读**：支持打开 `.md` 和 `.markdown` 文件，按终端宽度重新排版段落，并渲染标题目录、基础行内样式、列表、任务列表、引用、代码块、链接、图片占位和 GFM 表格。
@@ -48,7 +50,8 @@
 - **TXT 章节识别**：自动识别常见的章、回、卷、部、集及复合卷章结构，同时尽量避免把正文中的编号误判为章节。
 - **跨平台支持**：可运行于 macOS、Linux 和 Windows Terminal。
 
-[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Yangmoooo/peep/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Yangmoooo/peep/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Yangmoooo/peep/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Yangmoooo/peep/releases/tag/v0.1.0

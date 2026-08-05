@@ -41,7 +41,7 @@ peep path/to/book.epub
 或直接安装 Git tag 对应的版本：
 
 ```bash
-cargo install --git https://github.com/Yangmoooo/peep --tag v0.3.0 --locked
+cargo install --git https://github.com/Yangmoooo/peep --tag v0.4.0 --locked
 ```
 
 不带参数运行会恢复最近阅读的文件：
