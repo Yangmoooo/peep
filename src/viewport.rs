@@ -23,7 +23,9 @@ pub struct Viewport {
     total_chars: usize,
     anchor: usize,
     width: usize,
+    height: usize,
     wrapped: HashMap<usize, Vec<VisualLine>>,
+    max_anchor: Option<usize>,
 }
 
 impl Viewport {
@@ -36,7 +38,9 @@ impl Viewport {
             total_chars,
             anchor,
             width: 1,
+            height: 1,
             wrapped: HashMap::new(),
+            max_anchor: None,
         }
     }
 
@@ -49,6 +53,15 @@ impl Viewport {
         if self.width != width {
             self.width = width;
             self.wrapped.clear();
+            self.max_anchor = None;
+        }
+    }
+
+    fn set_height(&mut self, height: usize) {
+        let height = height.max(1);
+        if self.height != height {
+            self.height = height;
+            self.max_anchor = None;
         }
     }
 
@@ -56,6 +69,7 @@ impl Viewport {
         let offset = floor_char_boundary(text, offset.min(text.len()));
         let (hard_line, segment) = self.locate(text, offset);
         self.anchor = self.wrap_hard_line(text, hard_line)[segment].range.start;
+        self.clamp_anchor(text);
     }
 
     pub fn goto_percent(&mut self, text: &str, percent: f64) {
@@ -71,11 +85,7 @@ impl Viewport {
 
     pub fn goto_start(&mut self) { self.anchor = 0; }
 
-    pub fn goto_end(&mut self, text: &str) {
-        let hard_line = self.line_starts.len().saturating_sub(1);
-        let segments = self.wrap_hard_line(text, hard_line);
-        self.anchor = segments.last().map_or(0, |line| line.range.start);
-    }
+    pub fn goto_end(&mut self, text: &str) { self.anchor = self.max_anchor(text); }
 
     pub fn scroll_by(&mut self, text: &str, delta: isize) {
         if delta == 0 {
@@ -107,12 +117,15 @@ impl Viewport {
             }
         }
         self.anchor = self.wrap_hard_line(text, hard_line)[segment].range.start;
+        self.clamp_anchor(text);
     }
 
     pub fn visible_lines(&mut self, text: &str, height: usize) -> Vec<VisualLine> {
         if height == 0 {
             return Vec::new();
         }
+        self.set_height(height);
+        self.clamp_anchor(text);
         let (mut hard_line, mut segment) = self.locate(text, self.anchor);
         let mut lines = Vec::with_capacity(height);
         while lines.len() < height && hard_line < self.line_starts.len() {
@@ -208,6 +221,27 @@ impl Viewport {
         let start = self.line_starts[hard_line];
         self.line_char_starts[hard_line] + text[start..byte_offset].chars().count()
     }
+
+    fn clamp_anchor(&mut self, text: &str) { self.anchor = self.anchor.min(self.max_anchor(text)); }
+
+    fn max_anchor(&mut self, text: &str) -> usize {
+        if let Some(anchor) = self.max_anchor {
+            return anchor;
+        }
+        let mut remaining = self.height;
+        let mut anchor = 0;
+        for index in (0..self.line_starts.len()).rev() {
+            let line_count = self.wrap_hard_line(text, index).len();
+            if remaining <= line_count {
+                let segment = line_count - remaining;
+                anchor = self.wrap_hard_line(text, index)[segment].range.start;
+                break;
+            }
+            remaining -= line_count;
+        }
+        self.max_anchor = Some(anchor);
+        anchor
+    }
 }
 
 fn index_hard_lines(text: &str) -> (Vec<usize>, Vec<usize>, usize) {
@@ -278,5 +312,47 @@ mod tests {
         viewport.set_width(8);
         let after = viewport.progress_chars(text);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn end_stops_at_the_start_of_the_last_page() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(20);
+        viewport.visible_lines(text, 3);
+        viewport.goto_end(text);
+        let lines = viewport.visible_lines(text, 3);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(&text[lines[0].range()], "four");
+        assert_eq!(&text[lines[2].range()], "six");
+
+        viewport.scroll_by(text, 100);
+        let lines = viewport.visible_lines(text, 3);
+        assert_eq!(&text[lines[0].range()], "four");
+        assert_eq!(&text[lines[2].range()], "six");
+    }
+
+    #[test]
+    fn short_document_does_not_move_when_goto_end_is_pressed() {
+        let text = "one\ntwo";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(20);
+        viewport.visible_lines(text, 4);
+        viewport.goto_end(text);
+        assert_eq!(viewport.anchor(), 0);
+    }
+
+    #[test]
+    fn resizing_reclamps_an_old_end_anchor() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(20);
+        viewport.visible_lines(text, 3);
+        viewport.goto_end(text);
+        assert_eq!(&text[viewport.visible_lines(text, 3)[0].range()], "four");
+
+        let lines = viewport.visible_lines(text, 5);
+        assert_eq!(&text[lines[0].range()], "two");
+        assert_eq!(&text[lines[4].range()], "six");
     }
 }
