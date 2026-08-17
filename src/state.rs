@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
@@ -16,6 +17,8 @@ const BOOKMARK_SCHEMA: u32 = 1;
 const PREFERENCES_SCHEMA: u32 = 1;
 const HISTORY_SCHEMA: u32 = 1;
 const MAX_RECENT_BOOKS: usize = 100;
+
+static LAST_UPDATED_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct StateStore {
@@ -248,7 +251,7 @@ impl StateStore {
             path: path.clone(),
             fingerprint: fingerprint.to_owned(),
             position,
-            updated_unix_ms: now_unix_ms(),
+            updated_unix_ms: next_updated_unix_ms(),
             unknown,
         };
         self.write_json(&state_path, &state)
@@ -305,7 +308,7 @@ impl StateStore {
             schema: BOOKMARK_SCHEMA,
             path: path.clone(),
             fingerprint: fingerprint.to_owned(),
-            updated_unix_ms: now_unix_ms(),
+            updated_unix_ms: next_updated_unix_ms(),
             bookmarks,
             unknown,
         };
@@ -657,12 +660,37 @@ pub fn now_unix_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
+fn next_updated_unix_ms() -> u128 {
+    let current = now_unix_ms().try_into().unwrap_or(u64::MAX);
+    u128::from(monotonic_unix_ms(current, &LAST_UPDATED_UNIX_MS))
+}
+
+fn monotonic_unix_ms(current: u64, last: &AtomicU64) -> u64 {
+    let mut previous = last.load(Ordering::Relaxed);
+    loop {
+        let next = current.max(previous.saturating_add(1));
+        match last.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => previous = observed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bookmark(position: usize, label: Option<&str>, created_unix_ms: u128) -> Bookmark {
         Bookmark { position, label: label.map(str::to_owned), created_unix_ms }
+    }
+
+    #[test]
+    fn update_timestamps_are_strictly_increasing_within_the_same_millisecond() {
+        let last = AtomicU64::new(100);
+
+        assert_eq!(monotonic_unix_ms(100, &last), 101);
+        assert_eq!(monotonic_unix_ms(100, &last), 102);
+        assert_eq!(monotonic_unix_ms(200, &last), 200);
     }
 
     #[test]
