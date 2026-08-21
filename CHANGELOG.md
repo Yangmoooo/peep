@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-21
+
 ### Fixed
 
 - **正文末尾滚动**：滚动到文档末尾时现在会停在最后一页，而不是让最后一行文字提前贴近正文区域顶部；短文档和终端 resize 也会正确处理。
@@ -55,7 +57,8 @@
 - **TXT 章节识别**：自动识别常见的章、回、卷、部、集及复合卷章结构，同时尽量避免把正文中的编号误判为章节。
 - **跨平台支持**：可运行于 macOS、Linux 和 Windows Terminal。
 
-[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Yangmoooo/peep/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Yangmoooo/peep/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Yangmoooo/peep/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Yangmoooo/peep/compare/v0.1.0...v0.2.0
