@@ -1905,9 +1905,10 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.input(), "e nested/");
+        let nested_prefix = format!("e nested{}", std::path::MAIN_SEPARATOR);
+        assert_eq!(app.input(), nested_prefix);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.input(), "e nested/inside.txt");
+        assert_eq!(app.input(), format!("{nested_prefix}inside.txt"));
     }
 
     #[test]
