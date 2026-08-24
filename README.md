@@ -11,6 +11,8 @@ Peep 是一个本地、离线的终端 EPUB/TXT/Markdown 阅读器。界面保�
 - Vim 风格导航、宽松/精确/正则搜索和目录跳转。
 - 独立保存的书签与最近阅读列表。
 - 目录、书签和最近阅读浮窗的实时宽松过滤。
+- 可浏览当前目录并选择 EPUB、TXT 或 Markdown 文件。
+- 命令和 `:e` 路径的 Tab 补全。
 - 可即时切换并保存的自动、亮色和暗色主题。
 - 可用方向键浏览的跨会话命令与搜索历史。
 - 自动保存进度；文件仅改名或移动时通过 BLAKE3 恢复。
@@ -41,7 +43,7 @@ peep path/to/book.epub
 或直接安装 Git tag 对应的版本：
 
 ```bash
-cargo install --git https://github.com/Yangmoooo/peep --tag v0.4.0 --locked
+cargo install --git https://github.com/Yangmoooo/peep --tag v0.4.1 --locked
 ```
 
 不带参数运行会恢复最近阅读的文件：
@@ -97,10 +99,14 @@ peep --theme dark book.epub
 :q              退出
 ```
 
+`:e` 也可以接收目录。使用 `peep <directory>` 或 `:e <directory>` 会打开当前目录下的文件选择器，
+列出支持的 EPUB、TXT 和 Markdown 文件以及子目录；可用 `j/k`、翻页、`/` 过滤，按 `Enter` 打开或进入目录。
+在命令输入框中按 `Tab` 可以补全命令和 `:e` 的路径，连续按 `Tab` 可轮换候选项。
+
 所有浮窗都支持 `j/k`、方向键、`Ctrl-d/Ctrl-u`、`Space/b`、
-`PageUp/PageDown` 和 `Home/End` 导航。目录、书签、最近阅读和搜索结果浮窗可用
+`PageUp/PageDown` 和 `Home/End` 导航。目录、书签、最近阅读、文件选择器和搜索结果浮窗可用
 `Enter` 跳转或打开，书签浮窗使用 `x` 删除所选书签；`Esc` 关闭浮窗。
-在目录、书签和最近阅读浮窗中按 `/` 会聚焦底部输入框并实时过滤；`Enter` 或
+在目录、书签、最近阅读和文件选择器浮窗中按 `/` 会聚焦底部输入框并实时过滤；`Enter` 或
 `Esc` 返回列表，清空过滤词即可恢复完整列表。过滤使用与默认全文搜索相同的宽松匹配规则。
 
 默认 `/text` 是宽松字面搜索，只容忍排版差异，不会跳过额外的正文字符或跨越换行。
