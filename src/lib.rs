@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod document;
+mod file_picker;
 mod filter;
 mod history;
 mod loose_match;

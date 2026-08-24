@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app.override_theme(theme);
     }
     if let Some(path) = initial_file {
-        app.start_load(path);
+        app.open_path(path);
     }
     terminal::run(&mut app, !cli.no_mouse)?;
     Ok(())

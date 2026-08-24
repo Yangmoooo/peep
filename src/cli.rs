@@ -19,8 +19,8 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub theme: Option<ThemeChoice>,
 
-    /// EPUB, TXT, or Markdown file to open. Reopens the most recent file when
-    /// omitted.
+    /// EPUB, TXT, Markdown file, or directory to open. Reopens the most recent
+    /// file when omitted.
     pub file: Option<PathBuf>,
 }
 

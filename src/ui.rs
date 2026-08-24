@@ -96,7 +96,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     frame.render_widget(surface, area);
 
     if app.input_mode() != InputMode::Normal {
-        let prompt_width = 4 + UnicodeWidthStr::width(text.as_str());
+        let prompt_width = 4 + app.composer_cursor_width();
         let max_x = area.right().saturating_sub(1);
         let x = area.x.saturating_add(prompt_width.min(u16::MAX as usize) as u16).min(max_x);
         frame.set_cursor_position(Position::new(x, area.y.saturating_add(1)));

@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use directories::UserDirs;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::document::{DocumentSource, LoadOptions, LoadedDocument, open_document};
+use crate::file_picker::{FileEntry, read_directory};
 use crate::filter::FilteredList;
 use crate::history::InputHistory;
 use crate::search::{
@@ -41,14 +43,20 @@ pub enum OverlayKind {
     Bookmarks,
     Recent,
     SearchResults,
+    Files,
 }
 
 impl OverlayKind {
     pub fn is_list(self) -> bool {
-        matches!(self, Self::Toc | Self::Bookmarks | Self::Recent | Self::SearchResults)
+        matches!(
+            self,
+            Self::Toc | Self::Bookmarks | Self::Recent | Self::SearchResults | Self::Files
+        )
     }
 
-    fn is_filterable(self) -> bool { matches!(self, Self::Toc | Self::Bookmarks | Self::Recent) }
+    fn is_filterable(self) -> bool {
+        matches!(self, Self::Toc | Self::Bookmarks | Self::Recent | Self::Files)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -68,9 +76,11 @@ pub struct App {
     pub(crate) viewport: Option<Viewport>,
     pub(crate) input_mode: InputMode,
     pub(crate) input: String,
+    input_cursor: usize,
     command_history: InputHistory,
     search_history: InputHistory,
     pub(crate) overlay: Option<OverlayState>,
+    file_picker: Option<FilePickerState>,
     pub(crate) message: Option<String>,
     pub(crate) loading_path: Option<PathBuf>,
     pub(crate) current_match: Option<Range<usize>>,
@@ -92,6 +102,7 @@ pub struct App {
     dirty_progress: bool,
     last_move: Instant,
     should_quit: bool,
+    completion: Option<CompletionState>,
 }
 
 struct LoadTaskResult {
@@ -122,6 +133,18 @@ struct SearchContext {
     emphasis: Range<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct FilePickerState {
+    directory: PathBuf,
+    entries: Vec<FileEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct CompletionState {
+    candidates: Vec<String>,
+    next: usize,
+}
+
 impl App {
     pub fn new(cwd: PathBuf, store: StateStore) -> Self {
         let theme_choice = store.load_theme();
@@ -132,9 +155,11 @@ impl App {
             viewport: None,
             input_mode: InputMode::Normal,
             input: String::new(),
+            input_cursor: 0,
             command_history: InputHistory::new(history.commands),
             search_history: InputHistory::new(history.searches),
             overlay: None,
+            file_picker: None,
             message: None,
             loading_path: None,
             current_match: None,
@@ -156,6 +181,7 @@ impl App {
             dirty_progress: false,
             last_move: Instant::now(),
             should_quit: false,
+            completion: None,
         }
     }
 
@@ -168,6 +194,8 @@ impl App {
     pub fn input_mode(&self) -> InputMode { self.input_mode }
 
     pub fn input(&self) -> &str { &self.input }
+
+    pub fn input_cursor(&self) -> usize { self.input_cursor }
 
     pub fn theme_choice(&self) -> ThemeChoice { self.theme_choice }
 
@@ -218,10 +246,19 @@ impl App {
         self.loading_path = Some(path);
         self.message = None;
         self.overlay = None;
+        self.file_picker = None;
         self.current_match = None;
         self.search_generation = self.search_generation.wrapping_add(1);
         self.search_task = None;
         self.search_session = None;
+    }
+
+    pub fn open_path(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.show_file_picker(path);
+        } else {
+            self.start_load(path);
+        }
     }
 
     pub fn poll_tasks(&mut self) {
@@ -334,6 +371,22 @@ impl App {
         }
     }
 
+    pub fn composer_cursor_width(&self) -> usize {
+        match self.input_mode {
+            InputMode::Command | InputMode::Search => {
+                let prefix = &self.input[..self.input_cursor.min(self.input.len())];
+                let prompt = usize::from(matches!(self.input_mode, InputMode::Search));
+                UnicodeWidthStr::width(prefix) + prompt
+            }
+            InputMode::Filter => self
+                .overlay
+                .as_ref()
+                .and_then(|overlay| overlay.filter.as_ref())
+                .map_or(0, |filter| UnicodeWidthStr::width(filter.query())),
+            InputMode::Normal => 0,
+        }
+    }
+
     pub fn overlay_title(&self) -> Option<String> {
         let overlay = self.overlay.as_ref()?;
         match overlay.kind {
@@ -389,6 +442,24 @@ impl App {
                     .map_or(0, |hit| hit.ordinal.saturating_add(1));
                 Some(format!("Search results · {current}/{}", session.total))
             }
+            OverlayKind::Files => {
+                let total = self.file_picker.as_ref().map_or(0, |picker| picker.entries.len());
+                let directory = self.file_picker.as_ref().map_or_else(
+                    || "Files".to_owned(),
+                    |picker| picker.directory.display().to_string(),
+                );
+                if let Some(filter) = overlay.filter.as_ref().filter(|filter| filter.is_active()) {
+                    return Some(filtered_overlay_title(
+                        &format!("Open · {directory}"),
+                        overlay.selected,
+                        filter.len(),
+                        total,
+                    ));
+                }
+                let current =
+                    if total == 0 { 0 } else { overlay.selected.min(total.saturating_sub(1)) + 1 };
+                Some(format!("Open · {directory} · {current}/{total}"))
+            }
         }
     }
 
@@ -417,6 +488,7 @@ impl App {
             }
             OverlayKind::Recent => "No readable recent books".to_owned(),
             OverlayKind::SearchResults => "No search results".to_owned(),
+            OverlayKind::Files => "No supported files in this directory".to_owned(),
             OverlayKind::Help | OverlayKind::Info => return items,
         }]
     }
@@ -436,7 +508,9 @@ impl App {
                 ":toc             browse table of contents".to_owned(),
                 ":mark/:marks     add/browse bookmarks".to_owned(),
                 ":recent          browse recent books".to_owned(),
-                "/ in a list      filter toc/bookmarks/recent".to_owned(),
+                ":e <directory>   choose a supported file".to_owned(),
+                "/ in a list      filter toc/bookmarks/recent/files".to_owned(),
+                "Tab              complete commands and paths".to_owned(),
                 "↑/↓ in input     browse saved input history".to_owned(),
                 ":theme           choose auto/light/dark colors".to_owned(),
                 ":history clear   clear command/search history".to_owned(),
@@ -462,6 +536,11 @@ impl App {
             OverlayKind::Bookmarks => self.bookmark_items(),
             OverlayKind::Recent => self.recent_items(),
             OverlayKind::SearchResults => self.search_result_items(),
+            OverlayKind::Files => self
+                .file_picker
+                .as_ref()
+                .map(|picker| picker.entries.iter().map(FileEntry::label).collect())
+                .unwrap_or_default(),
         }
     }
 
@@ -556,9 +635,17 @@ impl App {
     }
 
     fn handle_input_key(&mut self, event: KeyEvent) {
+        if event.code == KeyCode::Tab {
+            if self.input_mode == InputMode::Command {
+                self.complete_input();
+            }
+            return;
+        }
+        self.completion = None;
         match event.code {
             KeyCode::Esc => {
                 self.input.clear();
+                self.input_cursor = 0;
                 self.reset_active_history_navigation();
                 self.input_mode = InputMode::Normal;
             }
@@ -566,6 +653,7 @@ impl App {
             KeyCode::Down => self.navigate_input_history(false),
             KeyCode::Enter => {
                 let input = std::mem::take(&mut self.input);
+                self.input_cursor = 0;
                 let mode = std::mem::replace(&mut self.input_mode, InputMode::Normal);
                 match mode {
                     InputMode::Command => {
@@ -588,18 +676,33 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                if let Some((start, _)) = self.input.grapheme_indices(true).next_back() {
-                    self.input.truncate(start);
+                let cursor = self.input_cursor;
+                if let Some((start, _)) = self.input[..cursor].grapheme_indices(true).next_back() {
+                    self.input.replace_range(start..cursor, "");
+                    self.input_cursor = start;
                 }
             }
+            KeyCode::Delete => {
+                let cursor = self.input_cursor;
+                if let Some((_, grapheme)) = self.input[cursor..].grapheme_indices(true).next() {
+                    let end = cursor + grapheme.len();
+                    self.input.replace_range(cursor..end, "");
+                }
+            }
+            KeyCode::Left => self.move_input_cursor_left(),
+            KeyCode::Right => self.move_input_cursor_right(),
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = self.input.len(),
             KeyCode::Char('u') if event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.clear();
+                self.input_cursor = 0;
             }
             KeyCode::Char(character)
                 if !event.modifiers.contains(KeyModifiers::CONTROL)
                     && !event.modifiers.contains(KeyModifiers::ALT) =>
             {
-                self.input.push(character);
+                self.input.insert(self.input_cursor, character);
+                self.input_cursor += character.len_utf8();
             }
             _ => {}
         }
@@ -616,6 +719,44 @@ impl App {
         };
         if let Some(replacement) = replacement {
             self.input = replacement;
+            self.input_cursor = self.input.len();
+        }
+    }
+
+    fn move_input_cursor_left(&mut self) {
+        if let Some((start, _)) = self.input[..self.input_cursor].grapheme_indices(true).next_back()
+        {
+            self.input_cursor = start;
+        }
+    }
+
+    fn move_input_cursor_right(&mut self) {
+        if let Some((_, grapheme)) = self.input[self.input_cursor..].grapheme_indices(true).next() {
+            self.input_cursor += grapheme.len();
+        }
+    }
+
+    fn complete_input(&mut self) {
+        if let Some(mut completion) = self.completion.take()
+            && !completion.candidates.is_empty()
+        {
+            let index = completion.next % completion.candidates.len();
+            self.input = completion.candidates[index].clone();
+            self.input_cursor = self.input.len();
+            completion.next = index.saturating_add(1);
+            self.completion = Some(completion);
+            return;
+        }
+
+        let candidates = completion_candidates(&self.input, self.input_cursor, &self.cwd);
+        if let Some(first) = candidates.first() {
+            self.input = first.clone();
+            self.input_cursor = self.input.len();
+            self.completion = if candidates.len() == 1 && input_ends_with_separator(&self.input) {
+                None
+            } else {
+                Some(CompletionState { candidates, next: 1 })
+            };
         }
     }
 
@@ -666,6 +807,7 @@ impl App {
         match event.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+                self.file_picker = None;
                 return;
             }
             KeyCode::Char('/') if overlay.filter.is_some() => {
@@ -707,6 +849,17 @@ impl App {
                     self.start_load(path);
                 } else {
                     self.overlay = Some(overlay);
+                }
+                return;
+            }
+            KeyCode::Enter if overlay.kind == OverlayKind::Files => {
+                let entry = selected_original_index(&overlay)
+                    .and_then(|index| self.file_picker.as_ref()?.entries.get(index))
+                    .cloned();
+                match entry {
+                    Some(entry) if entry.is_directory => self.show_file_picker(entry.path),
+                    Some(entry) => self.start_load(entry.path),
+                    None => self.overlay = Some(overlay),
                 }
                 return;
             }
@@ -822,6 +975,8 @@ impl App {
     fn begin_input(&mut self, mode: InputMode) {
         self.input_mode = mode;
         self.input.clear();
+        self.input_cursor = 0;
+        self.completion = None;
         self.reset_active_history_navigation();
         self.message = None;
     }
@@ -834,12 +989,39 @@ impl App {
         }
         self.input_mode = InputMode::Normal;
         self.overlay = Some(overlay);
+        self.file_picker = None;
         self.overlay_list_offset = 0;
+    }
+
+    fn show_file_picker(&mut self, directory: PathBuf) {
+        match read_directory(&directory) {
+            Ok((directory, entries)) => {
+                let mut overlay = OverlayState::new(OverlayKind::Files, 0);
+                if !entries.is_empty() {
+                    overlay.filter = Some(FilteredList::new(entries.len()));
+                }
+                self.file_picker = Some(FilePickerState { directory, entries });
+                self.input_mode = InputMode::Normal;
+                self.overlay = Some(overlay);
+                self.overlay_list_offset = 0;
+                self.overlay_max_position = self
+                    .file_picker
+                    .as_ref()
+                    .map_or(0, |picker| picker.entries.len().saturating_sub(1));
+                self.message = None;
+            }
+            Err(error) => {
+                self.file_picker = None;
+                self.overlay = None;
+                self.message =
+                    Some(format!("Cannot open directory {}: {error}", directory.display()));
+            }
+        }
     }
 
     fn execute_command(&mut self, raw: &str) {
         match parse_command(raw) {
-            Ok(Command::Open(path)) => self.start_load(self.resolve_path(&path)),
+            Ok(Command::Open(path)) => self.open_path(self.resolve_path(&path)),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(Command::Toc) => {
                 if self.loaded.as_ref().is_some_and(|loaded| !loaded.document().toc().is_empty()) {
@@ -1368,6 +1550,122 @@ enum HistoryScope {
     Searches,
 }
 
+const COMMAND_COMPLETIONS: &[&str] = &[
+    "e",
+    "open",
+    "q",
+    "quit",
+    "toc",
+    "mark",
+    "marks",
+    "bookmarks",
+    "recent",
+    "exact",
+    "re",
+    "regex",
+    "results",
+    "info",
+    "help",
+    "h",
+    "theme",
+    "history",
+    "goto",
+];
+
+fn completion_candidates(input: &str, cursor: usize, cwd: &Path) -> Vec<String> {
+    let cursor = cursor.min(input.len());
+    if !input.is_char_boundary(cursor) {
+        return Vec::new();
+    }
+    let before = &input[..cursor];
+    let Some(command_end) = before.find(char::is_whitespace) else {
+        let prefix = before.to_ascii_lowercase();
+        return COMMAND_COMPLETIONS
+            .iter()
+            .filter(|command| command.starts_with(&prefix))
+            .map(|command| (*command).to_owned())
+            .collect();
+    };
+    let command = before[..command_end].to_ascii_lowercase();
+    if command != "e" && command != "open" {
+        return Vec::new();
+    }
+    let argument_start = before[command_end..]
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map_or(cursor, |(offset, _)| command_end + offset);
+    if argument_start > cursor {
+        return Vec::new();
+    }
+    let raw_path = &before[argument_start..];
+    complete_path_candidates(raw_path, cwd)
+        .into_iter()
+        .map(|replacement| {
+            let mut candidate = input.to_owned();
+            candidate.replace_range(argument_start..cursor, &replacement);
+            candidate
+        })
+        .collect()
+}
+
+fn complete_path_candidates(raw: &str, cwd: &Path) -> Vec<String> {
+    let quote = raw.chars().next().filter(|character| *character == '\'' || *character == '"');
+    let unquoted = quote.map_or(raw, |quote| &raw[quote.len_utf8()..]);
+    let separator = unquoted
+        .char_indices()
+        .rev()
+        .find(|(_, character)| *character == '/' || *character == '\\');
+    let (base, fragment) = separator
+        .map_or(("", unquoted), |(offset, _)| (&unquoted[..=offset], &unquoted[offset + 1..]));
+    let directory = resolve_completion_path(base, cwd);
+    let Ok((_, entries)) = read_directory(&directory) else {
+        return Vec::new();
+    };
+    let separator = base
+        .chars()
+        .last()
+        .filter(|character| *character == '/' || *character == '\\')
+        .unwrap_or(std::path::MAIN_SEPARATOR);
+    entries
+        .into_iter()
+        .filter(|entry| !entry.is_parent && path_name_matches(&entry.name, fragment))
+        .map(|entry| {
+            let mut replacement = format!("{base}{}", entry.name);
+            if entry.is_directory {
+                replacement.push(separator);
+            }
+            quote.map_or_else(|| replacement.clone(), |quote| format!("{quote}{replacement}"))
+        })
+        .collect()
+}
+
+fn resolve_completion_path(raw: &str, cwd: &Path) -> PathBuf {
+    let path = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        UserDirs::new()
+            .map(|directories| {
+                if raw.len() == 1 {
+                    directories.home_dir().to_path_buf()
+                } else {
+                    directories.home_dir().join(&raw[2..])
+                }
+            })
+            .unwrap_or_else(|| PathBuf::from(raw))
+    } else {
+        PathBuf::from(raw)
+    };
+    if path.is_absolute() { path } else { cwd.join(path) }
+}
+
+fn path_name_matches(name: &str, fragment: &str) -> bool {
+    if cfg!(windows) {
+        name.to_lowercase().starts_with(&fragment.to_lowercase())
+    } else {
+        name.starts_with(fragment)
+    }
+}
+
+fn input_ends_with_separator(input: &str) -> bool { input.trim_end().ends_with(['/', '\\']) }
+
 fn parse_command(raw: &str) -> Result<Command, String> {
     let raw = raw.trim();
     let (name, arguments) =
@@ -1573,6 +1871,89 @@ mod tests {
             parse_command("e books/my novel.epub").unwrap(),
             Command::Open("books/my novel.epub".to_owned())
         );
+    }
+
+    #[test]
+    fn command_completion_completes_commands_and_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("alpha.txt"), "text").unwrap();
+        fs::write(directory.path().join("beta.md"), "# Markdown").unwrap();
+        fs::write(directory.path().join("ignored.pdf"), "pdf").unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("nested/inside.txt"), "text").unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in "th".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input(), "theme");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in "e a".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input(), "e alpha.txt");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in "e n".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input(), "e nested/");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input(), "e nested/inside.txt");
+    }
+
+    #[test]
+    fn command_input_supports_grapheme_cursor_editing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in "ab中文".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input(), "ab文");
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('前'), KeyModifiers::NONE));
+        assert_eq!(app.input(), "前ab文");
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor(), app.input().len());
+    }
+
+    #[test]
+    fn opening_a_directory_shows_supported_files_and_opens_the_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("book.txt"), "text").unwrap();
+        fs::write(directory.path().join("notes.markdown"), "# Notes").unwrap();
+        fs::write(directory.path().join("ignored.pdf"), "pdf").unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+
+        app.open_path(directory.path().to_path_buf());
+        assert_eq!(app.overlay().map(|overlay| overlay.kind), Some(OverlayKind::Files));
+        let items = app.overlay_items();
+        assert!(items.contains(&"nested/".to_owned()));
+        assert!(items.contains(&"book.txt".to_owned()));
+        assert!(items.contains(&"notes.markdown".to_owned()));
+        assert!(!items.contains(&"ignored.pdf".to_owned()));
+
+        let selected = items.iter().position(|item| item == "book.txt").unwrap();
+        app.overlay.as_mut().unwrap().selected = selected;
+        app.set_overlay_layout(items.len(), items.len());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.overlay().is_none());
+        let expected = fs::canonicalize(directory.path().join("book.txt")).unwrap();
+        assert_eq!(app.loading_path.as_deref(), Some(expected.as_path()));
     }
 
     #[test]
