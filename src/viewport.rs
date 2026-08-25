@@ -146,6 +146,9 @@ impl Viewport {
         if self.total_chars == 0 {
             return 0.0;
         }
+        if self.max_anchor.is_some_and(|max_anchor| max_anchor > 0 && self.anchor == max_anchor) {
+            return 100.0;
+        }
         self.progress_chars(text) as f64 * 100.0 / self.total_chars as f64
     }
 
@@ -333,6 +336,21 @@ mod tests {
     }
 
     #[test]
+    fn final_page_reports_full_progress() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(20);
+        viewport.visible_lines(text, 3);
+        viewport.goto_end(text);
+
+        assert_eq!(viewport.progress_percent(text), 100.0);
+
+        viewport.goto_start();
+        viewport.scroll_by(text, 100);
+        assert_eq!(viewport.progress_percent(text), 100.0);
+    }
+
+    #[test]
     fn short_document_does_not_move_when_goto_end_is_pressed() {
         let text = "one\ntwo";
         let mut viewport = Viewport::new(text, 0);
@@ -340,6 +358,7 @@ mod tests {
         viewport.visible_lines(text, 4);
         viewport.goto_end(text);
         assert_eq!(viewport.anchor(), 0);
+        assert_eq!(viewport.progress_percent(text), 0.0);
     }
 
     #[test]
