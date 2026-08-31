@@ -353,7 +353,7 @@ impl App {
     pub fn composer_text(&self) -> String {
         match self.input_mode {
             InputMode::Command => self.input.clone(),
-            InputMode::Search => format!("/{}", self.input),
+            InputMode::Search => self.input.clone(),
             InputMode::Filter => self
                 .overlay
                 .as_ref()
@@ -371,12 +371,18 @@ impl App {
         }
     }
 
+    pub fn composer_prompt(&self) -> &'static str {
+        match self.input_mode {
+            InputMode::Search | InputMode::Filter => "⌕ ",
+            InputMode::Normal | InputMode::Command => "› ",
+        }
+    }
+
     pub fn composer_cursor_width(&self) -> usize {
         match self.input_mode {
             InputMode::Command | InputMode::Search => {
                 let prefix = &self.input[..self.input_cursor.min(self.input.len())];
-                let prompt = usize::from(matches!(self.input_mode, InputMode::Search));
-                UnicodeWidthStr::width(prefix) + prompt
+                UnicodeWidthStr::width(prefix)
             }
             InputMode::Filter => self
                 .overlay
@@ -2017,6 +2023,22 @@ mod tests {
     }
 
     #[test]
+    fn slash_focuses_search_input_without_becoming_visible_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path().join("state")).unwrap();
+        let mut app = App::new(directory.path().to_path_buf(), store);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.input_mode(), InputMode::Search);
+        assert_eq!(app.composer_text(), "");
+        assert_eq!(app.composer_prompt(), "⌕ ");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.composer_text(), "q");
+        assert_eq!(app.composer_cursor_width(), 1);
+    }
+
+    #[test]
     fn theme_command_applies_and_persists_the_preference() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path().join("state")).unwrap();
@@ -2070,14 +2092,14 @@ mod tests {
         let mut second = App::new(directory.path().to_path_buf(), store.clone());
         second.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         second.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(second.composer_text(), "/风起");
+        assert_eq!(second.composer_text(), "风起");
         second.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         second.execute_command("history clear searches");
 
         let mut third = App::new(directory.path().to_path_buf(), store);
         third.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         third.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(third.composer_text(), "/");
+        assert_eq!(third.composer_text(), "");
     }
 
     #[test]

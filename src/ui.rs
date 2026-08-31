@@ -82,8 +82,10 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
         InputMode::Normal if app.message.is_some() => surface_style,
         InputMode::Normal => surface_style.patch(theme.muted),
     };
-    let line =
-        Line::from(vec![Span::styled("› ", prompt_style), Span::styled(text.as_str(), text_style)]);
+    let line = Line::from(vec![
+        Span::styled(app.composer_prompt(), prompt_style),
+        Span::styled(text.as_str(), text_style),
+    ]);
     let block = if theme.surface_visible {
         Block::default().padding(ratatui::widgets::Padding::new(2, 1, 1, 1))
     } else {
