@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
 ### Added
 
 - **目录文件选择器**：打开目录时可浏览当前路径下的 EPUB、TXT 和 Markdown 文件，使用 `Enter` 打开文件或进入子目录。
@@ -67,7 +69,8 @@
 - **TXT 章节识别**：自动识别常见的章、回、卷、部、集及复合卷章结构，同时尽量避免把正文中的编号误判为章节。
 - **跨平台支持**：可运行于 macOS、Linux 和 Windows Terminal。
 
-[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Yangmoooo/peep/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Yangmoooo/peep/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Yangmoooo/peep/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Yangmoooo/peep/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Yangmoooo/peep/compare/v0.2.0...v0.3.0

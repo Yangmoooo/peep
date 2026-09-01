@@ -131,12 +131,12 @@ mod imp {
         if output.is_null() || output == INVALID_HANDLE_VALUE {
             return None;
         }
-        // SAFETY: the structure is initialized with its required size before the API
-        // call.
+        // SAFETY: the structure is initialized with its required size before
+        // the API call.
         let mut info = unsafe { std::mem::zeroed::<CONSOLE_SCREEN_BUFFER_INFOEX>() };
         info.cbSize = std::mem::size_of::<CONSOLE_SCREEN_BUFFER_INFOEX>() as u32;
-        // SAFETY: `output` is a borrowed console handle and `info` is a valid output
-        // pointer.
+        // SAFETY: `output` is a borrowed console handle and `info` is a valid
+        // output pointer.
         if unsafe { GetConsoleScreenBufferInfoEx(output, &mut info) } == 0 {
             return None;
         }
