@@ -142,14 +142,16 @@ impl Viewport {
 
     pub fn progress_chars(&self, text: &str) -> usize { self.char_at_byte(text, self.anchor) }
 
-    pub fn progress_percent(&self, text: &str) -> f64 {
+    pub fn progress_percent(&mut self, text: &str) -> f64 {
         if self.total_chars == 0 {
             return 0.0;
         }
-        if self.max_anchor.is_some_and(|max_anchor| max_anchor > 0 && self.anchor == max_anchor) {
-            return 100.0;
-        }
-        self.progress_chars(text) as f64 * 100.0 / self.total_chars as f64
+        let lines = self.visible_lines(text, self.height);
+        let Some(last) = lines.last() else {
+            return 0.0;
+        };
+        let end_chars = last.char_start + text[last.range.clone()].chars().count();
+        end_chars as f64 * 100.0 / self.total_chars as f64
     }
 
     fn locate(&mut self, text: &str, offset: usize) -> (usize, usize) {
@@ -351,6 +353,59 @@ mod tests {
     }
 
     #[test]
+    fn progress_tracks_the_bottom_of_the_page_without_moving_the_anchor() {
+        let text = "一二三四五六七八九十";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(4);
+        viewport.visible_lines(text, 2);
+
+        assert_eq!(viewport.progress_percent(text), 40.0);
+        assert_eq!(viewport.anchor(), 0);
+        assert_eq!(viewport.progress_chars(text), 0);
+
+        viewport.scroll_by(text, 1);
+        assert_eq!(viewport.progress_percent(text), 60.0);
+        assert_eq!(viewport.anchor(), "一二".len());
+        assert_eq!(viewport.progress_chars(text), 2);
+
+        viewport.goto_percent(text, 50.0);
+        assert_eq!(viewport.progress_chars(text), 4);
+        assert_eq!(viewport.progress_percent(text), 80.0);
+        assert_eq!(viewport.progress_chars(text), 4);
+    }
+
+    #[test]
+    fn progress_updates_when_the_page_is_resized() {
+        let text = "abcdefghij";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(2);
+        viewport.visible_lines(text, 2);
+        assert_eq!(viewport.progress_percent(text), 40.0);
+
+        viewport.set_width(3);
+        assert_eq!(viewport.progress_percent(text), 60.0);
+        viewport.visible_lines(text, 3);
+        assert_eq!(viewport.progress_percent(text), 90.0);
+        assert_eq!(viewport.anchor(), 0);
+    }
+
+    #[test]
+    fn progress_handles_empty_text_and_trailing_blank_lines() {
+        let mut empty = Viewport::new("", 0);
+        empty.visible_lines("", 3);
+        assert_eq!(empty.progress_percent(""), 0.0);
+
+        let text = "a\n\nb\n\n";
+        let mut viewport = Viewport::new(text, 0);
+        viewport.set_width(20);
+        viewport.visible_lines(text, 2);
+        assert_eq!(viewport.progress_percent(text), 100.0 / 3.0);
+        viewport.goto_end(text);
+        assert_eq!(viewport.progress_percent(text), 100.0);
+        assert!(viewport.anchor() > 0);
+    }
+
+    #[test]
     fn short_document_does_not_move_when_goto_end_is_pressed() {
         let text = "one\ntwo";
         let mut viewport = Viewport::new(text, 0);
@@ -358,7 +413,7 @@ mod tests {
         viewport.visible_lines(text, 4);
         viewport.goto_end(text);
         assert_eq!(viewport.anchor(), 0);
-        assert_eq!(viewport.progress_percent(text), 0.0);
+        assert_eq!(viewport.progress_percent(text), 100.0);
     }
 
     #[test]

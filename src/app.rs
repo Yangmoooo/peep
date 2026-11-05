@@ -336,8 +336,8 @@ impl App {
         viewport.visible_lines(loaded.document().text(), height)
     }
 
-    pub fn progress_percent(&self) -> f64 {
-        let (Some(loaded), Some(viewport)) = (self.loaded.as_ref(), self.viewport.as_ref()) else {
+    pub fn progress_percent(&mut self) -> f64 {
+        let (Some(loaded), Some(viewport)) = (self.loaded.as_ref(), self.viewport.as_mut()) else {
             return 0.0;
         };
         viewport.progress_percent(loaded.document().text())
@@ -1465,15 +1465,17 @@ impl App {
         let Some(loaded) = self.loaded.as_ref() else {
             return Vec::new();
         };
+        let position = self.progress_chars();
+        let total_chars = loaded.document().total_chars();
         let mut lines = vec![
             format!("Path: {}", loaded.path().display()),
             format!("Format: {}", loaded.format()),
             format!("Title: {}", loaded.document().metadata().title().unwrap_or("Unknown")),
             format!(
                 "Position: {} / {} characters ({:.1}%)",
-                self.progress_chars(),
-                loaded.document().total_chars(),
-                self.progress_percent()
+                position,
+                total_chars,
+                position as f64 * 100.0 / total_chars.max(1) as f64
             ),
         ];
         for warning in loaded.warnings() {

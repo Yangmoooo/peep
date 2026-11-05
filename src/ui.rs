@@ -105,7 +105,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
     }
 }
 
-fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect, theme: Theme) {
+fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, theme: Theme) {
     let area = area.inner(Margin { horizontal: 3, vertical: 0 });
     let left = compact_home(app.cwd());
     let right = format!("{:.0}%", app.progress_percent());
